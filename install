@@ -1,0 +1,15 @@
+#!/bin/sh
+# Create venv (if needed) and install nev-server for command-line use.
+set -e
+cd "$(dirname "$0")"
+if [ ! -d .venv ]; then
+  python3 -m venv .venv
+fi
+.venv/bin/pip install -U pip -q
+.venv/bin/pip install -e .
+echo ""
+echo "Installed. Run:"
+echo "  .venv/bin/nev-server --mock"
+echo "Or add to PATH:"
+echo "  export PATH=\"$(pwd)/.venv/bin:\$PATH\""
+echo "  nev-server --mock"

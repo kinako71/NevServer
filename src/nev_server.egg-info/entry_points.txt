@@ -1,0 +1,2 @@
+[console_scripts]
+nev-server = nev.server:main

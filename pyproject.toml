@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nev-server"
+version = "2.0.0.dev0"
+description = "NAHAR Evaluation Bench server (Python port of nev_server)"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+hardware = ["nidaqmx>=1.4", "niscope", "nimodinst", "nitclk"]
+
+[project.scripts]
+nev-server = "nev.server:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

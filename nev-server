@@ -1,0 +1,11 @@
+#!/bin/sh
+# Launcher: uses project venv when present, otherwise python3 -m nev.
+ROOT="$(cd "$(dirname "$0")" && pwd)"
+if [ -x "$ROOT/.venv/bin/nev-server" ]; then
+  exec "$ROOT/.venv/bin/nev-server" "$@"
+fi
+if [ -x "$ROOT/.venv/bin/python" ]; then
+  exec "$ROOT/.venv/bin/python" -m nev "$@"
+fi
+export PYTHONPATH="$ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
+exec python3 -m nev "$@"

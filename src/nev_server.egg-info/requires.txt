@@ -1,0 +1,3 @@
+
+[hardware]
+nidaqmx>=1.4

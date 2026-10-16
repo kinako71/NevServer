@@ -1,0 +1,52 @@
+Metadata-Version: 2.4
+Name: nev-server
+Version: 2.0.0.dev0
+Summary: NAHAR Evaluation Bench server (Python port of nev_server)
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+Provides-Extra: hardware
+Requires-Dist: nidaqmx>=1.4; extra == "hardware"
+
+# nev-server (Python)
+
+C 版 `nev_server`（Rev. 1.3a）の Python 移植です。既存の TCP クライアントと同じテキストコマンドプロトコル（`#OK` / `#NG`）を維持します。
+
+## 実行（コマンドライン）
+
+**初回だけ**（venv 作成 + インストール）:
+
+```bash
+cd python
+./install
+```
+
+**サーバ起動**（C 版と同様ポート 9000）:
+
+```bash
+cd python
+./nev-server --mock        # ハードなし（開発・macOS）
+./nev-server               # Linux 計測 PC（DAQmx は今後接続）
+./nev-server --port 9000
+./nev-server -h
+```
+
+PATH に venv を入れた場合は、どのディレクトリからでも:
+
+```bash
+export PATH="/path/to/R1.3a_20171012/python/.venv/bin:$PATH"
+nev-server --mock
+```
+
+C 版 `nev_server` と同じく、クライアントは `localhost:9000` に TCP 接続します。
+
+## 構成（C との対応）
+
+| Python | C |
+|--------|---|
+| `nev.tcps` | `nev_tcps.c` |
+| `nev.shell` | `nev_shell.c` |
+| `nev.handlers.*` | `*_sh.c` / `nev_server.c` |
+| `nev.metecore` | `nev_metecore.c` |
+| `nev.hardware` | `nev_daqmx.c`, `nev_niscope.c` |
+
+現フェーズ: TCP + シェル（comparser / データ受信）の骨組み。DAQmx・NI-SCOPE・PSA の各ハンドラはスタブです。
