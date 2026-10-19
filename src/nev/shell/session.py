@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import select
+import sys
 import time
 
 from nev.shell.constants import (
@@ -53,6 +54,13 @@ class NevShell:
                 if not chunk:
                     return NEVSHELL_ERR_SOCK
                 text = chunk.decode("ascii", errors="replace")
+                # Match the C shell's stderr trace when a command arrives.
+                command_text = text.rstrip("\0\r\n")
+                print(
+                    f'\n[shell] command mode "{command_text}"',
+                    file=sys.stderr,
+                    flush=True,
+                )
                 log.debug("command mode: %r", text)
                 tokens = tokenize_command(text)
                 if len(tokens) > NEVSHELL_MAX_COMTOKENS:
