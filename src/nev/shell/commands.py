@@ -12,7 +12,7 @@ def build_command_tree() -> CommandNode:
     """Create the grammar; nested nodes represent successive command words."""
     com_stop_psa = CommandNode(literal="PSA", handler=S("STOP PSA"))
 
-    com_run_dao = CommandNode(literal="DAO", handler=S("RUN DAO"))
+    com_run_ao = CommandNode(literal="AO", handler=S("RUN AO"))
     com_run_psa = CommandNode(literal="PSA", handler=S("RUN PSA"))
 
     com_set_ns_devs = CommandNode(literal="DEVS", handler=S("SET NSU DEVS"))
@@ -31,19 +31,18 @@ def build_command_tree() -> CommandNode:
         ],
     )
 
-    com_set_dao_dlen = CommandNode(literal="DLEN", handler=S("SET DAO DLEN"))
-    com_set_dao_freq = CommandNode(literal="FREQ", handler=S("SET DAO FREQ"))
-    com_set_dao_branch = CommandNode(
-        literal="DAO",
-        children=[com_set_dao_dlen, com_set_dao_freq],
-        handler=S("SET DAO"),
-    )  # mirrors SET / DAO + SETDAO subcommands
+    com_set_ao_dlen = CommandNode(literal="DLEN", handler=S("SET AO DLEN"))
+    com_set_ao_freq = CommandNode(literal="FREQ", handler=S("SET AO FREQ"))
+    com_set_ao_branch = CommandNode(
+        literal="AO",
+        children=[com_set_ao_dlen, com_set_ao_freq],
+        handler=S("SET AO"),
+    )
 
     com_set = CommandNode(
         children=[
-            CommandNode(literal="SAO", handler=S("SET SAO")),
-            CommandNode(literal="SDO", handler=S("SET SDO")),
-            com_set_dao_branch,
+            CommandNode(literal="DO", handler=S("SET DO")),
+            com_set_ao_branch,
             com_set_nsu,
             CommandNode(literal="PSA", handler=S("SET PSA")),
             CommandNode(literal="PRC", handler=S("SET PRC")),
@@ -81,9 +80,10 @@ def build_command_tree() -> CommandNode:
             CommandNode(literal="SYSINFO", handler=sys.nev_sys_echoinfo),
             CommandNode(literal="DAQMXINFO", handler=device.get_daqmx_info),
             CommandNode(literal="NISCOPEINFO", handler=S("GET NISCOPEINFO")),
-            CommandNode(literal="SAO", handler=device.get_sao),
-            CommandNode(literal="SDO", handler=device.get_sdo),
+            CommandNode(literal="AO", handler=device.get_ao),
+            CommandNode(literal="DO", handler=device.get_do),
             CommandNode(literal="AI", handler=device.get_ai),
+            CommandNode(literal="DI", handler=device.get_di),
             com_get_nsu,
             com_get_psa,
             com_get_prc,
@@ -95,8 +95,17 @@ def build_command_tree() -> CommandNode:
         children=[
             CommandNode(literal="GET", children=com_get.children),
             CommandNode(literal="SET", children=com_set.children),
-            CommandNode(literal="RUN", children=[com_run_dao, com_run_psa, CommandNode(literal="PRC", handler=S("RUN PRC"))]),
-            CommandNode(literal="STOP", children=[com_stop_psa, CommandNode(literal="DAO", handler=S("STOP DAO"))]),
+            CommandNode(literal="RUN", children=[
+                com_run_ao,
+                CommandNode(literal="AI", handler=device.run_ai),
+                com_run_psa,
+                CommandNode(literal="PRC", handler=S("RUN PRC")),
+            ]),
+            CommandNode(literal="STOP", children=[
+                com_stop_psa,
+                CommandNode(literal="AO", handler=S("STOP AO")),
+                CommandNode(literal="AI", handler=device.stop_ai),
+            ]),
             CommandNode(literal="ZEROCLEAR", handler=S("ZEROCLEAR")),
         ],
     )

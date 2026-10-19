@@ -91,12 +91,13 @@ class Task:
     running: bool = False
 
 
-# These task records are the protocol-side state. Mock mode stores them only in
-# memory; real mode binds their values and settings to native NI task state.
+# These task records mirror the physical AO/AI/DO/DI task lists. Mock mode
+# stores them in memory; real mode shares their buffers with native NI tasks.
 TASKS: dict[str, list[Task]] = {
-    "SAO": [Task(0, "Dev1", "PXI-6704", [0.0] * 16, length=1, frequency=0.0)],
-    "DAO": [Task(1, "Dev2", "PXI-6733", [0.0] * (8 * 1024))],
-    "SDO": [Task(0, "Dev1", "PXI-6704", [0.0] * 8, length=1, frequency=0.0)],
+    "AO": [Task(0, "Dev1", "Mock AO", [0.0] * (4 * 1024))],
+    "AI": [Task(0, "Dev1", "Mock AI", [0.0] * 1024)],
+    "DO": [Task(0, "Dev1", "Mock DO", [0.0] * 8, length=1, frequency=0.0)],
+    "DI": [Task(0, "Dev1", "Mock DI", [0.0] * 8, length=1, frequency=0.0)],
 }
 
 
@@ -112,26 +113,26 @@ def _group(name: str, args: list[str], c: ShellConnection, allow_all=False):
     return None if idx is None else [(idx, tasks[idx])]
 
 
-def _get_digital(group, args, c):
-    """Format a stored SAO/SDO task using the legacy GET response layout."""
+def _get_values(group, args, c):
+    """Format one physical AO/DO task using the shell response layout."""
     found = _group(group, args, c)
     if found is None:
         return 0
     idx, task = found[0]
     label = "GET" + group
-    values = " ".join(str(int(v)) if group == "SDO" else f"{v:f}" for v in task.values)
+    values = " ".join(str(int(v)) if group == "DO" else f"{v:f}" for v in task.values)
     return _send(c, f"#{label} {idx}\n{values} \n#OK")
 
 
-def _set_static(group, args, c):
-    """Update static output values and write them to NI hardware when enabled."""
+def _set_values(group, args, c):
+    """Update AO/DO values and write them to NI hardware when enabled."""
     from nev.hardware.bootstrap import get_runtime, write_daq
     runtime = get_runtime()
     found = _group(group, args, c)
     if found is None:
         return 0
     task = found[0][1]
-    if group == "SDO":
+    if group == "DO":
         vals = []
         for item in args[1:]:
             try: vals.append(int(float(item)) & 0xff)
@@ -148,23 +149,23 @@ def _set_static(group, args, c):
     return _ok(c)
 
 
-def _set_dao(args, c):
-    """Enter streamed DAO data mode and commit the waveform on ``#OK``."""
+def _set_ao(args, c):
+    """Enter streamed AO waveform mode and commit the data on ``#OK``."""
     from nev.hardware.bootstrap import get_runtime, reconfigure_daq, write_daq
     runtime = get_runtime()
-    found = _group("DAO", args, c)
+    found = _group("AO", args, c)
     if found is None: return 0
     idx, task = found[0]
     width=len(task.values)//task.length if task.length else 0
     channel = _index(c, args[1:2], width)
     if channel is None: return 0
-    if _send(c, f"#SETDAO {idx} #OK\n") < 0: return -17
+    if _send(c, f"#SETAO {idx} #OK\n") < 0: return -17
     width=len(task.values)//task.length
     def update(_task):
         """Commit the received values and restore a ready output task."""
         if not runtime.mock:
-            reconfigure_daq("DAO", idx)
-            write_daq("DAO", idx)
+            reconfigure_daq("AO", idx)
+            write_daq("AO", idx)
         task.running = False
         return 0
     if set_data_req("r", task.values, task.length, width, 0, channel, update, task) < 0:
@@ -172,10 +173,10 @@ def _set_dao(args, c):
     return 0
 
 
-def _set_dao_param(param, args, c):
-    """Set DAO length or frequency for one task or every configured task."""
+def _set_ao_param(param, args, c):
+    """Set AO length or frequency for one task or every configured task."""
     from nev.hardware.bootstrap import get_runtime, reconfigure_daq
-    found = _group("DAO", args, c, allow_all=True)
+    found = _group("AO", args, c, allow_all=True)
     if found is None: return 0
     value = _int(c, args[1] if len(args) > 1 and param == "DLEN" else None) if param == "DLEN" else _float(c, args[1] if len(args) > 1 else None)
     if value is None: return 0
@@ -188,64 +189,66 @@ def _set_dao_param(param, args, c):
             task.length = value
             task.values[:] = [0.0] * (width * value)
             if not runtime.mock:
-                runtime.daq["DAO"][idx].length=value
+                runtime.daq["AO"][idx].length = value
         else:
             task.frequency = value
             if not runtime.mock:
-                runtime.daq["DAO"][idx].frequency=value
+                runtime.daq["AO"][idx].frequency = value
         if not runtime.mock:
-            reconfigure_daq("DAO", idx)
+            reconfigure_daq("AO", idx)
             task.running = False
     return _ok(c)
 
 
-def _run_dao(args, c):
-    """Start analog output for one DAO task or all tasks."""
-    from nev.hardware.bootstrap import get_runtime, run_daq
+def _run_ao(args, c):
+    """Start one AO task or all AO tasks."""
+    from nev.hardware.bootstrap import get_runtime, reconfigure_daq
     runtime = get_runtime()
-    found = _group("DAO", args, c, allow_all=True)
+    found = _group("AO", args, c, allow_all=True)
     if found is None: return 0
     for idx, task in found:
         if not runtime.mock:
-            run_daq(idx)
+            native = runtime.daq["AO"][idx]
+            if native.native is None:
+                reconfigure_daq("AO", idx)
+            if not native.running:
+                native.native.start()
+                native.running = True
         task.running = True
     return _ok(c)
 
 
-def _stop_dao(args, c):
-    """Stop real output tasks when applicable and clear their running flags."""
-    from nev.hardware.bootstrap import get_runtime, stop_daq
+def _stop_ao(args, c):
+    """Stop one AO task or all AO tasks."""
     runtime = get_runtime()
-    found = _group("DAO", args, c, allow_all=True)
+    found = _group("AO", args, c, allow_all=True)
     if found is None: return 0
     for idx, task in found:
         if not runtime.mock:
-            stop_daq(idx)
+            native = runtime.daq["AO"][idx]
+            if native.native is not None and native.running:
+                native.native.stop()
+                native.running = False
         task.running = False
-        if runtime.mock:
-            import math
-            runtime.ai_data[idx] = [math.sin(sample * 0.01) for sample in range(task.length)]
     return _ok(c)
 
 
 def _zero(args, c):
-    """Clear every output group and restart real DAO tasks at zero output."""
+    """Clear every AO and DO task, restarting continuous AO tasks."""
     from nev.hardware.bootstrap import get_runtime, reconfigure_daq, write_daq
     runtime = get_runtime()
-    for group, tasks in TASKS.items():
+    for group in ("AO", "DO"):
+        tasks = TASKS[group]
         for idx, task in enumerate(tasks):
             task.values[:] = [0.0] * len(task.values)
             task.running = False
             if not runtime.mock:
-                native_item = runtime.daq[group][idx]
-                native_item.values[:] = task.values
-                if group == "DAO" and not runtime.mock:
-                    reconfigure_daq("DAO", idx)
-                    native_item = runtime.daq[group][idx]
+                if group == "AO":
+                    reconfigure_daq("AO", idx)
                 write_daq(group, idx)
-                if group == "DAO":
-                    native_item.native.start()
-                    native_item.running = True
+                if group == "AO" and task.frequency > 0:
+                    runtime.daq["AO"][idx].native.start()
+                    runtime.daq["AO"][idx].running = True
                     task.running = True
     return _ok(c)
 
@@ -370,7 +373,7 @@ def _scope_set(kind,args,c):
     return _ok(c)
 
 
-PSA = {"status":"INVALID","start":0.0,"stop":0.0,"steps":0,"skip":0,"values":[],"source":"SAO","device":0,"channel":0,"union":0}
+PSA = {"status":"INVALID","start":0.0,"stop":0.0,"steps":0,"skip":0,"values":[],"source":"AO","device":0,"channel":0,"union":0}
 _psa_cancel = threading.Event()
 
 
@@ -382,10 +385,9 @@ def _psa_set(args,c):
     try:
         union=int(args[0]); source=args[1].strip("[]"); device=int(args[2]); channel=int(args[3]); start=float(args[4]); stop=float(args[5]); steps=int(args[6]); skip=int(args[7])
     except (ValueError,IndexError): return _error(c,"!INVALID_VALUE")
-    width = (len(TASKS[source][device].values)//TASKS[source][device].length
-             if source == "DAO" and source in TASKS and device < len(TASKS[source]) else
-             len(TASKS[source][device].values) if source in TASKS and device < len(TASKS[source]) else 0)
-    if union not in range(4) or source not in TASKS or device not in range(len(TASKS[source])) or channel not in range(width) or steps<=0 or skip<0:
+    width = (len(TASKS[source][device].values) // TASKS[source][device].length
+             if source == "AO" and source in TASKS and device < len(TASKS[source]) else 0)
+    if union not in range(4) or source != "AO" or device not in range(len(TASKS["AO"])) or channel not in range(width) or steps<=0 or skip<0:
         return _error(c,"!INVALID_SCAN_CONFIGURATION")
     PSA.update(status="VALID",mode="PSA",start=start,stop=stop,steps=steps,skip=skip,values=[],source=source,device=device,channel=channel,union=union)
     PSA["error"]=""
@@ -411,8 +413,8 @@ def _psa_run(args,c):
 def _execute_psa_scan():
     """Step the selected output through scan values and collect scope samples."""
     from nev.hardware.bootstrap import (
-        acquire_scope, configure_scope, get_runtime, reconfigure_daq,
-        run_daq, write_daq,
+        acquire_scope, configure_scope, get_runtime,
+        reconfigure_daq, write_daq,
     )
     runtime = get_runtime()
     task=TASKS[PSA["source"]][PSA["device"]]
@@ -426,17 +428,20 @@ def _execute_psa_scan():
                 PSA["status"]="ABORTED"
                 return
             parameter=PSA["start"]+(PSA["stop"]-PSA["start"])*i/PSA["steps"]
-            width=len(task.values)//task.length if PSA["source"]=="DAO" else len(task.values)
-            offset=PSA["channel"]*task.length if PSA["source"]=="DAO" else PSA["channel"]
-            task.values[offset]=parameter
+            offset=PSA["channel"]*task.length
+            if task.length > 1:
+                task.values[offset:offset + task.length] = [parameter] * task.length
+            else:
+                task.values[offset]=parameter
             if not runtime.mock:
-                if PSA["source"]=="DAO":
-                    reconfigure_daq("DAO",PSA["device"])
-                    write_daq("DAO",PSA["device"])
-                    run_daq(PSA["device"])
+                if task.frequency > 0:
+                    reconfigure_daq("AO",PSA["device"])
+                    write_daq("AO",PSA["device"])
+                    runtime.daq["AO"][PSA["device"]].native.start()
+                    runtime.daq["AO"][PSA["device"]].running = True
                     task.running=True
                 else:
-                    write_daq(PSA["source"],PSA["device"])
+                    write_daq("AO",PSA["device"])
                 samples=acquire_scope(union)
                 samples=[[channel[PSA["skip"]:] for channel in device] for device in samples]
             else:
@@ -517,10 +522,10 @@ def handler_for(name: str) -> Callable[[list[str], ShellConnection], int]:
     """
     table={
         "GET NISCOPEINFO":_scope_info,
-        "GET SAO":lambda a,c:_get_digital("SAO",a,c),"GET SDO":lambda a,c:_get_digital("SDO",a,c),
-        "SET SAO":lambda a,c:_set_static("SAO",a,c),"SET SDO":lambda a,c:_set_static("SDO",a,c),
-        "SET DAO":_set_dao,"SET DAO DLEN":lambda a,c:_set_dao_param("DLEN",a,c),
-        "SET DAO FREQ":lambda a,c:_set_dao_param("FREQ",a,c),"RUN DAO":_run_dao,"STOP DAO":_stop_dao,"ZEROCLEAR":_zero,
+        "GET AO":lambda a,c:_get_values("AO",a,c),"GET DO":lambda a,c:_get_values("DO",a,c),
+        "SET AO":_set_ao,"SET AO DLEN":lambda a,c:_set_ao_param("DLEN",a,c),
+        "SET AO FREQ":lambda a,c:_set_ao_param("FREQ",a,c),"SET DO":lambda a,c:_set_values("DO",a,c),
+        "RUN AO":_run_ao,"STOP AO":_stop_ao,"ZEROCLEAR":_zero,
         "GET NSU NUM":lambda a,c:_scope_get("NUM",a,c),"GET NSU DEVS":lambda a,c:_scope_get("DEVS",a,c),
         "GET NSU CHAN":lambda a,c:_scope_get("CHAN",a,c),"GET NSU DLEN":lambda a,c:_scope_get("DLEN",a,c),
         "GET NSU FREQ":lambda a,c:_scope_get("FREQ",a,c),"GET NSU TRIG":lambda a,c:_scope_get("TRIG",a,c),

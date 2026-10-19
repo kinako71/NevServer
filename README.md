@@ -38,9 +38,9 @@ C 版 `nev_server` と同じく、クライアントは `localhost:9000` に TCP
 | `nev.metecore`   | `nev_metecore.c`               |
 | `nev.hardware`   | `nev_daqmx.c`, `nev_niscope.c` |
 
-`--mock`を付けるとNI固有関数を呼ばずにモックデータを使います。実機モードではコマンド処理を共通に保ち、NI固有関数を呼ぶ箇所でNI APIを実行します。`GET DAQMXINFO` はC互換のSAO/DAO/SDOタスク情報に加え、NI実機では各デバイスの製品情報、シリアル番号、AI/AOチャンネル、端子を `DEVICE[...]` 行で返します。
+`--mock`を付けるとNI固有関数を呼ばずにモックデータを使います。実機モードではコマンド処理を共通に保ち、NI固有関数を呼ぶ箇所でNI APIを実行します。`GET DAQMXINFO` はAO/AI/DO/DIタスク情報に加え、NI実機では各デバイスの製品情報、シリアル番号、チャンネル、端子を `DEVICE[...]` 行で返します。
 
-`RUN DAO <index>` でAI (`PXI1Slot4/ai0`) とAOを同期して開始し、`GET AI <index>` で入力波形を取得、`STOP DAO <index>` で停止します。AOのサンプルクロックと開始トリガーには、提示された `/PXI1Slot4/te0/SampleClock` と `/PXI1Slot4/te0/StartTrigger` を使います。
+シェルコマンドはbootstrap.pyが列挙した物理グループをそのまま使います。`GET AO/AI/DO/DI <index>`でタスク値を読み、`SET AO <index> <channel>`でAO波形、`SET DO <index> <values...>`でDO値を設定します。AOの長さとサンプル周波数は`SET AO DLEN/FREQ`、出力開始停止は`RUN/STOP AO`で操作します。AIは`RUN/STOP AI`で制御し、`GET AI`で1ブロックを読みます。各グループのタスク番号は`GET DAQMXINFO`に表示されます。
 
 実機用Python依存は次のコマンドで追加できます:
 

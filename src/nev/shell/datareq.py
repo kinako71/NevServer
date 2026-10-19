@@ -1,4 +1,4 @@
-"""State and parser for streamed numeric payloads such as ``SET DAO`` data."""
+"""State and parser for streamed numeric payloads such as ``SET AO`` data."""
 
 from __future__ import annotations
 

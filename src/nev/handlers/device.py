@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import math
 
-from nev.hardware.bootstrap import daqmx_device_inventory, get_runtime, read_ai
+from nev.hardware.bootstrap import daqmx_device_inventory, get_runtime, read_ai, read_di
 from nev.shell.constants import NEVSHELL_ERR_INDEX_EMPTY, NEVSHELL_ERR_INDEX_INVALID
 from nev.shell.protocol import ShellConnection
 
@@ -35,29 +35,52 @@ def _get_daq(group: str, args: list[str], connection: ShellConnection) -> int:
         # NI SDK reads are not needed for output buffers that were set here.
         values = list(tasks[index].values)
         if not runtime.mock:
-            # The native task's state is kept in sync by SET/RUN handlers.
-            native = runtime.daq[group][index]
-            values = list(native.values)
+            # Output buffers are shared with their physical task records.
+            values = list(runtime.daq[group][index].values)
     except (IndexError, KeyError):
         connection.sh_error_code(NEVSHELL_ERR_INDEX_INVALID, args[0])
         return 0
 
     label = f"GET{group}"
-    if group == "SDO":
+    if group in ("DO", "DI"):
         payload = " ".join(str(int(value)) for value in values)
     else:
         payload = " ".join(f"{value:f}" for value in values)
     return connection.send_text(f"#{label} {index}\n{payload} \n#OK")
 
 
-def get_sao(args: list[str], connection: ShellConnection) -> int:
-    """Handle ``GET SAO`` using the shared task buffer."""
-    return _get_daq("SAO", args, connection)
+def get_ao(args: list[str], connection: ShellConnection) -> int:
+    """Handle ``GET AO`` using the shared output task buffer."""
+    return _get_daq("AO", args, connection)
 
 
-def get_sdo(args: list[str], connection: ShellConnection) -> int:
-    """Handle ``GET SDO`` using the shared task buffer."""
-    return _get_daq("SDO", args, connection)
+def get_do(args: list[str], connection: ShellConnection) -> int:
+    """Handle ``GET DO`` using the shared output task buffer."""
+    return _get_daq("DO", args, connection)
+
+
+def get_di(args: list[str], connection: ShellConnection) -> int:
+    """Read or return one digital-input task."""
+    from nev.handlers import device_commands
+    runtime = get_runtime()
+    if not args:
+        connection.sh_error_code(NEVSHELL_ERR_INDEX_EMPTY, None)
+        return 0
+    try:
+        index = int(args[0], 10)
+    except ValueError:
+        connection.sh_error_code(NEVSHELL_ERR_INDEX_INVALID, args[0])
+        return 0
+    tasks = device_commands.TASKS["DI"]
+    if index < 0 or index >= len(tasks):
+        connection.sh_error_code(NEVSHELL_ERR_INDEX_INVALID, args[0])
+        return 0
+    try:
+        values = list(tasks[index].values) if runtime.mock else read_di(index)
+    except Exception as exc:
+        return connection.sh_error(f"!DAQMX_API_ERROR({exc})")
+    payload = " ".join(str(int(value)) for value in values)
+    return connection.send_text(f"#GETDI {index}\n{payload} \n#OK")
 
 
 def get_daqmx_info(args: list[str], connection: ShellConnection) -> int:
@@ -68,10 +91,10 @@ def get_daqmx_info(args: list[str], connection: ShellConnection) -> int:
         info = {}
         for group, tasks in device_commands.TASKS.items():
             info[group] = [
-                (task.device, task.device_name, task.model,
-                 len(task.values) // task.length if group == "DAO" else len(task.values),
+                (task_index, task.device_name, task.model,
+                 len(task.values) // task.length if group in ("AO", "AI") and task.length else len(task.values),
                  task.length, task.frequency, task.running)
-                for task in tasks
+                for task_index, task in enumerate(tasks)
             ]
         if runtime.mock:
             # The mock inventory is descriptive fixture data, not NI discovery.
@@ -84,12 +107,12 @@ def get_daqmx_info(args: list[str], connection: ShellConnection) -> int:
                         "ai_channels": [], "ao_channels": [], "terminals": [],
                         "terminals_error": None,
                     })
-                    if group == "DAO":
-                        entry["ai_channels"].append(f"{task.device_name}/ai0")
-                    if group in ("SAO", "DAO"):
-                        width = len(task.values) // task.length if group == "DAO" else len(task.values)
+                    if group == "AI":
+                        entry["ai_channels"].extend(f"{task.device_name}/ai{i}" for i in range(len(task.values) // task.length))
+                    if group == "AO":
+                        width = len(task.values) // task.length if task.length else len(task.values)
                         entry["ao_channels"].extend(f"{task.device_name}/ao{i}" for i in range(width))
-                    elif group == "SDO":
+                    elif group == "DO":
                         entry["terminals"].extend(f"{task.device_name}/port0/line{i}" for i in range(len(task.values)))
             devices = list(devices_by_name.values())
         else:
@@ -99,8 +122,8 @@ def get_daqmx_info(args: list[str], connection: ShellConnection) -> int:
         return connection.sh_error(f"!DAQMX_API_ERROR({exc})")
     if connection.send_text("#DAQMXINFO\n") < 0:
         return -17
-    # 先頭の3グループはC版 nevDAQmx_shINFO と同じ形式を維持する。
-    for group in ("SAO", "DAO", "SDO"):
+    # Report the physical groups discovered by bootstrap.py.
+    for group in ("AO", "AI", "DO", "DI"):
         records = "".join(
             f"[{device},{name},{model},{channels},{length},{frequency:f},{int(running)}]"
             for device, name, model, channels, length, frequency, running in info.get(group, [])
@@ -131,7 +154,7 @@ def get_daqmx_info(args: list[str], connection: ShellConnection) -> int:
 
 
 def get_ai(args: list[str], connection: ShellConnection) -> int:
-    """Read and format the AI waveform paired with a running DAO task."""
+    """Read and format the indexed analog-input task."""
     from nev.handlers import device_commands
     runtime = get_runtime()
     if not args:
@@ -142,22 +165,22 @@ def get_ai(args: list[str], connection: ShellConnection) -> int:
     except ValueError:
         connection.sh_error_code(NEVSHELL_ERR_INDEX_INVALID, args[0])
         return 0
-    if index < 0 or index >= len(device_commands.TASKS["DAO"]):
+    # Both modes index AI independently from analog output tasks.
+    task_count = len(device_commands.TASKS["AI"]) if runtime.mock else len(runtime.daq["AI"])
+    if index < 0 or index >= task_count:
         connection.sh_error_code(NEVSHELL_ERR_INDEX_INVALID, args[0])
         return 0
     try:
         if runtime.mock:
-            task = device_commands.TASKS["DAO"][index]
-            if task.running:
-                values = [math.sin(sample * 0.01) for sample in range(task.length)]
-                runtime.ai_data[index] = values
-            elif index in runtime.ai_data:
-                values = list(runtime.ai_data[index])
-            else:
-                raise RuntimeError("AI acquisition is not running for this DAO task")
+            task = device_commands.TASKS["AI"][index]
+            values = list(runtime.ai_data.get(
+                index, [math.sin(sample * 0.01) for sample in range(task.length)]
+            ))
+            runtime.ai_data[index] = values
         else:
-            # Only real mode reaches the NI sample-read function.
+            # The bootstrap owns AI tasks separately from output tasks.
             values = read_ai(index)
+            device_commands.TASKS["AI"][index].running = runtime.daq["AI"][index].running
     except (IndexError, KeyError):
         connection.sh_error_code(NEVSHELL_ERR_INDEX_INVALID, args[0])
         return 0
@@ -165,3 +188,63 @@ def get_ai(args: list[str], connection: ShellConnection) -> int:
         return connection.sh_error(f"!DAQMX_API_ERROR({exc})")
     payload = " ".join(f"{value:f}" for value in values)
     return connection.send_text(f"#GETAI {index}\n{payload} \n#OK")
+
+
+def run_ai(args: list[str], connection: ShellConnection) -> int:
+    """Start one independently discovered AI task."""
+    runtime = get_runtime()
+    try:
+        index = _ai_index(args, connection, runtime)
+        if index is None:
+            return 0
+        if runtime.mock:
+            import nev.handlers.device_commands as commands
+            task = commands.TASKS["AI"][index]
+            task.running = True
+            runtime.ai_data[index] = [math.sin(sample * 0.01) for sample in range(task.length)]
+        else:
+            from nev.hardware.bootstrap import run_ai as start_ai
+            start_ai(index)
+            from nev.handlers import device_commands
+            device_commands.TASKS["AI"][index].running = True
+        return connection.sh_term()
+    except Exception as exc:
+        return connection.sh_error(f"!DAQMX_API_ERROR({exc})")
+
+
+def stop_ai(args: list[str], connection: ShellConnection) -> int:
+    """Stop one AI task and retain its last acquired block."""
+    runtime = get_runtime()
+    try:
+        index = _ai_index(args, connection, runtime)
+        if index is None:
+            return 0
+        if not runtime.mock:
+            from nev.hardware.bootstrap import stop_ai as halt_ai
+            halt_ai(index)
+            from nev.handlers import device_commands
+            device_commands.TASKS["AI"][index].running = False
+        else:
+            import nev.handlers.device_commands as commands
+            commands.TASKS["AI"][index].running = False
+        return connection.sh_term()
+    except Exception as exc:
+        return connection.sh_error(f"!DAQMX_API_ERROR({exc})")
+
+
+def _ai_index(args: list[str], connection: ShellConnection, runtime) -> int | None:
+    """Validate an AI task index for mock or real hardware."""
+    from nev.handlers import device_commands
+    if not args:
+        connection.sh_error_code(NEVSHELL_ERR_INDEX_EMPTY, None)
+        return None
+    try:
+        index = int(args[0], 10)
+    except ValueError:
+        connection.sh_error_code(NEVSHELL_ERR_INDEX_INVALID, args[0])
+        return None
+    count = len(device_commands.TASKS["AI"]) if runtime.mock else len(runtime.daq["AI"])
+    if not 0 <= index < count:
+        connection.sh_error_code(NEVSHELL_ERR_INDEX_INVALID, args[0])
+        return None
+    return index

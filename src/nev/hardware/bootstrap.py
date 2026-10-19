@@ -60,7 +60,6 @@ class HardwareRuntime:
     scopes: list[ScopeDevice] = field(default_factory=list)
     ai_tasks: dict[int, Any] = field(default_factory=dict)
     ai_data: dict[int, list[float]] = field(default_factory=dict)
-
     def close(self) -> None:
         """Stop and release all driver objects without double-closing tasks."""
         daq_task_ids = {
@@ -400,20 +399,17 @@ def _bind_shell_state(state: HardwareRuntime) -> None:
     if state.mock:
         return
 
+    # Keep each shell-visible task list in the same order and shape as the
+    # physical groups discovered by this bootstrap implementation.
     handlers.TASKS = {
         group: [
             handlers.Task(
-                d.device_id,
-                d.name,
-                d.model,
-                d.values,
-                d.length,
-                d.frequency,
-                d.running,
+                item.device_id, item.name, item.model, item.values,
+                item.length, item.frequency, item.running,
             )
-            for d in items
+            for item in state.daq[group]
         ]
-        for group, items in state.daq.items()
+        for group in DAQ_GROUPS
     }
 
     handlers.SCOPE_DEVICES = [
@@ -437,8 +433,6 @@ def _bind_shell_state(state: HardwareRuntime) -> None:
         index: [(2.0, "DC") for _ in range(device.channel_count)]
         for index, device in enumerate(state.scopes[:1])
     }
-
-
 def write_daq(
     group: str,
     index: int,
@@ -626,7 +620,7 @@ def read_ai(index: int) -> list[float]:
             for x in channel_samples
         ]
 
-    item.values = result
+    item.values[:] = result
     runtime_.ai_data[index] = list(result)
     return result
 
@@ -661,7 +655,7 @@ def stop_ai(index: int) -> None:
                     for x in channel_samples
                 ]
 
-            item.values = result
+            item.values[:] = result
             runtime_.ai_data[index] = list(result)
 
     finally:
@@ -691,7 +685,7 @@ def read_di(index: int) -> list[float]:
         result = [result]
 
     values = [float(bool(value)) for value in result]
-    item.values = values
+    item.values[:] = values
     return values
 
 
