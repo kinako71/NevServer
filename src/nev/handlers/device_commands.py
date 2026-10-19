@@ -379,8 +379,9 @@ _psa_cancel = threading.Event()
 
 def _psa_set(args,c):
     """Validate scan parameters and store a reusable PSA configuration."""
-    # The legacy shell represents each bracket as its own token.
-    args=[v for v in args if v not in ("[", "]")]
+    # The shell splits on spaces, so grouped values arrive as tokens such as
+    # "[AO" and "0]" rather than as a single bracketed token.
+    args=[v.strip("[]") for v in args if v.strip("[]")]
     if len(args)<8: return _error(c,"!SCAN_PARAMETER_NOT_GIVEN")
     try:
         union=int(args[0]); source=args[1].strip("[]"); device=int(args[2]); channel=int(args[3]); start=float(args[4]); stop=float(args[5]); steps=int(args[6]); skip=int(args[7])
