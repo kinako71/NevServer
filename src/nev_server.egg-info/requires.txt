@@ -1,3 +1,6 @@
 
 [hardware]
 nidaqmx>=1.4
+niscope
+nimodinst
+nitclk

@@ -6,7 +6,8 @@ src/nev/server.py
 src/nev/tcps.py
 src/nev/version.py
 src/nev/handlers/__init__.py
-src/nev/handlers/stubs.py
+src/nev/handlers/device.py
+src/nev/handlers/device_commands.py
 src/nev/handlers/sys.py
 src/nev/hardware/__init__.py
 src/nev/hardware/bootstrap.py

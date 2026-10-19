@@ -1,3 +1,4 @@
+
 """Discover NI devices and own driver tasks used by shell command handlers."""
 
 from __future__ import annotations
@@ -9,17 +10,22 @@ from typing import Any
 
 log = logging.getLogger(__name__)
 
+SAMPLE_RATE = 100000.0
+SAMPLES_PER_CHANNEL = 1024
+DAQ_GROUPS = ("AO", "AI", "DO", "DI")
+
 
 @dataclass
 class DeviceTask:
     """Pair a protocol task's values/settings with its optional NI task."""
+
     kind: str
     name: str
     model: str
     channels: list[str]
     values: list[float]
-    length: int = 1024
-    frequency: float = 100000.0
+    length: int = SAMPLES_PER_CHANNEL
+    frequency: float = SAMPLE_RATE
     native: Any = None
     running: bool = False
     device_id: int = 0
@@ -27,7 +33,8 @@ class DeviceTask:
 
 @dataclass
 class ScopeDevice:
-    """Keep enumerated scope identity alongside its live driver session."""
+    """Keep NI-SCOPE identity alongside its live driver session."""
+
     name: str
     model: str
     channel_count: int
@@ -39,463 +46,844 @@ class ScopeDevice:
 
 @dataclass
 class HardwareRuntime:
-    """Own every driver object for one mock or real-hardware server run."""
+    """Own driver objects for one mock or real-hardware server run."""
+
     mock: bool
-    daq: dict[str, list[DeviceTask]] = field(default_factory=lambda: {"SAO": [], "DAO": [], "SDO": []})
+    daq: dict[str, list[DeviceTask]] = field(
+        default_factory=lambda: {
+            "AO": [],
+            "AI": [],
+            "DO": [],
+            "DI": [],
+        }
+    )
     scopes: list[ScopeDevice] = field(default_factory=list)
     ai_tasks: dict[int, Any] = field(default_factory=dict)
     ai_data: dict[int, list[float]] = field(default_factory=dict)
 
     def close(self) -> None:
-        """Stop and release open tasks, tolerating individual close failures."""
+        """Stop and release all driver objects without double-closing tasks."""
+        daq_task_ids = {
+            id(item.native)
+            for group in self.daq.values()
+            for item in group
+            if item.native is not None
+        }
+
         for group in self.daq.values():
             for item in group:
-                if item.native is not None:
-                    try:
-                        if item.running:
-                            item.native.stop()
-                        item.native.close()
-                    except Exception:
-                        log.exception("Could not close DAQmx task %s", item.name)
+                task = item.native
+                if task is None:
+                    continue
+
+                try:
+                    if item.running:
+                        task.stop()
+                except Exception:
+                    log.exception("Could not stop DAQ task %s", item.name)
+
+                try:
+                    task.close()
+                except Exception:
+                    log.exception("Could not close DAQ task %s", item.name)
+
+                item.native = None
+                item.running = False
+
+        # AI registry entries normally point to tasks already closed above.
+        for task in self.ai_tasks.values():
+            if id(task) in daq_task_ids:
+                continue
+            try:
+                task.close()
+            except Exception:
+                log.exception("Could not close detached AI task")
+
+        self.ai_tasks.clear()
+        self.ai_data.clear()
+
         for item in self.scopes:
             try:
                 item.native.close()
             except Exception:
-                log.exception("Could not close niScope session %s", item.name)
-        for item in self.ai_tasks.values():
-            try:
-                item.close()
-            except Exception:
-                log.exception("Could not close synchronized analog input task")
-        self.ai_tasks.clear()
+                log.exception(
+                    "Could not close niScope session %s", item.name
+                )
+
+        self.scopes.clear()
 
 
 runtime: HardwareRuntime | None = None
 
 
 def get_runtime() -> HardwareRuntime:
-    """Return initialized runtime state or explain why hardware is unavailable."""
+    """Return initialized runtime state."""
     if runtime is None:
         raise RuntimeError("NI hardware runtime is not initialized")
     return runtime
 
 
 def close_hardware() -> None:
-    """Release the active runtime and clear the module-level reference."""
+    """Release active runtime."""
     global runtime
+
     if runtime is not None:
         runtime.close()
         runtime = None
 
 
 def _open_daq(state: HardwareRuntime) -> None:
-    """Enumerate supported NI DAQ devices and create output tasks for them."""
+    """Discover AO/AI/DO/DI channels and create NI-DAQmx tasks."""
     import nidaqmx
     from nidaqmx.constants import AcquisitionType, LineGrouping
     from nidaqmx.system import System
 
-    supported = {"PXI-6704": ("S", 16, 8), "PXI-6733": ("D", 8, 4), "PXI-6713": ("D", 8, 4)}
-    for device_id, device in enumerate(System.local().devices):
-        model = str(device.product_type)
-        spec = supported.get(model)
-        if spec is None:
-            continue
-        mode, max_ao, max_do = spec
+    for group in DAQ_GROUPS:
+        state.daq.setdefault(group, [])
+
+    devices = list(System.local().devices)
+
+    for device_id, device in enumerate(devices):
         name = str(device.name)
-        ao = [str(ch.name) for ch in device.ao_physical_chans][:max_ao]
-        do = [str(ch.name) for ch in device.do_lines][:max_do]
+        model = str(device.product_type)
+
+        ao = [str(ch.name) for ch in device.ao_physical_chans]
+        ai = [str(ch.name) for ch in device.ai_physical_chans]
+        do = [str(line.name) for line in device.do_lines]
+        di = [str(line.name) for line in device.di_lines]
+
+        log.info(
+            "DAQ device %s (%s): AO=%d, AI=%d, DO=%d, DI=%d",
+            name, model, len(ao), len(ai), len(do), len(di),
+        )
+
+        # --------------------------------------------
+        # Analog Output
+        # --------------------------------------------
         if ao:
-            group = "SAO" if mode == "S" else "DAO"
-            task = nidaqmx.Task(f"nev_{group}_{name}")
+            max_rate = float(
+                getattr(device, "ao_max_rate", 0.0) or 0.0
+            )
+            supports_clock = bool(
+                getattr(device, "ao_samp_clk_supported", False)
+            )
+            dynamic = supports_clock and max_rate > 0
+            rate = min(SAMPLE_RATE, max_rate) if dynamic else 0.0
+            length = SAMPLES_PER_CHANNEL if dynamic else 1
+
+            task = nidaqmx.Task(f"nev_AO_{name}")
             try:
                 for channel in ao:
                     task.ao_channels.add_ao_voltage_chan(channel)
-                if group == "DAO":
-                    task.timing.cfg_samp_clk_timing(100000.0, sample_mode=AcquisitionType.CONTINUOUS, samps_per_chan=1024)
-                is_dynamic = group == "DAO"
-                state.daq[group].append(DeviceTask(
-                    group, name, model, ao,
-                    [0.0] * len(ao) * (1024 if is_dynamic else 1),
-                    length=1024 if is_dynamic else 1,
-                    frequency=100000.0 if is_dynamic else 0.0,
-                    native=task, device_id=device_id,
-                ))
+
+                if dynamic:
+                    task.timing.cfg_samp_clk_timing(
+                        rate=rate,
+                        sample_mode=AcquisitionType.CONTINUOUS,
+                        samps_per_chan=length,
+                    )
+
+                state.daq["AO"].append(
+                    DeviceTask(
+                        kind="AO",
+                        name=name,
+                        model=model,
+                        channels=ao,
+                        values=[0.0] * (len(ao) * length),
+                        length=length,
+                        frequency=rate,
+                        native=task,
+                        device_id=device_id,
+                    )
+                )
             except Exception:
                 task.close()
                 raise
+
+        # --------------------------------------------
+        # Analog Input
+        # --------------------------------------------
+        if ai:
+            max_rate = float(
+                getattr(device, "ai_max_single_chan_rate", 0.0) or 0.0
+            )
+            supports_clock = bool(
+                getattr(device, "ai_samp_clk_supported", False)
+            )
+            dynamic = supports_clock and max_rate > 0
+            rate = min(SAMPLE_RATE, max_rate) if dynamic else 0.0
+            length = SAMPLES_PER_CHANNEL if dynamic else 1
+
+            task = nidaqmx.Task(f"nev_AI_{name}")
+            try:
+                for channel in ai:
+                    task.ai_channels.add_ai_voltage_chan(channel)
+
+                if dynamic:
+                    task.timing.cfg_samp_clk_timing(
+                        rate=rate,
+                        sample_mode=AcquisitionType.CONTINUOUS,
+                        samps_per_chan=length,
+                    )
+
+                state.daq["AI"].append(
+                    DeviceTask(
+                        kind="AI",
+                        name=name,
+                        model=model,
+                        channels=ai,
+                        values=[0.0] * (len(ai) * length),
+                        length=length,
+                        frequency=rate,
+                        native=task,
+                        device_id=device_id,
+                    )
+                )
+            except Exception:
+                task.close()
+                raise
+
+        # --------------------------------------------
+        # Digital Output
+        # --------------------------------------------
         if do:
-            task = nidaqmx.Task(f"nev_SDO_{name}")
+            task = nidaqmx.Task(f"nev_DO_{name}")
             try:
                 for channel in do:
-                    task.do_channels.add_do_chan(channel, line_grouping=LineGrouping.CHAN_PER_LINE)
-                state.daq["SDO"].append(DeviceTask(
-                    "SDO", name, model, do, [0.0] * len(do),
-                    length=1, frequency=0.0, native=task, device_id=device_id,
-                ))
+                    task.do_channels.add_do_chan(
+                        channel,
+                        line_grouping=LineGrouping.CHAN_PER_LINE,
+                    )
+
+                state.daq["DO"].append(
+                    DeviceTask(
+                        kind="DO",
+                        name=name,
+                        model=model,
+                        channels=do,
+                        values=[0.0] * len(do),
+                        length=1,
+                        frequency=0.0,
+                        native=task,
+                        device_id=device_id,
+                    )
+                )
             except Exception:
                 task.close()
                 raise
-    if not any(state.daq.values()):
-        raise RuntimeError("No supported NI-DAQmx outputs found (PXI-6704/6733/6713)")
+
+        # --------------------------------------------
+        # Digital Input
+        # --------------------------------------------
+        if di:
+            task = nidaqmx.Task(f"nev_DI_{name}")
+            try:
+                for channel in di:
+                    task.di_channels.add_di_chan(
+                        channel,
+                        line_grouping=LineGrouping.CHAN_PER_LINE,
+                    )
+
+                state.daq["DI"].append(
+                    DeviceTask(
+                        kind="DI",
+                        name=name,
+                        model=model,
+                        channels=di,
+                        values=[0.0] * len(di),
+                        length=1,
+                        frequency=0.0,
+                        native=task,
+                        device_id=device_id,
+                    )
+                )
+            except Exception:
+                task.close()
+                raise
+
+    if not any(state.daq[group] for group in DAQ_GROUPS):
+        raise RuntimeError(
+            "No usable NI-DAQmx AO/AI/DO/DI channels found"
+        )
 
 
 def _open_scopes(state: HardwareRuntime) -> None:
-    """Discover NI-SCOPE devices with NI-ModInst and open driver sessions."""
+    """Discover NI-SCOPE devices and open driver sessions."""
     import nimodinst
     import niscope
 
+    # Copy device properties while the enumeration session is alive.
     with nimodinst.Session("niscope") as enumeration:
-        # NI-ModInst exposes the device name/model/serial/slot fields used by
-        # the standalone device-information example.
-        devices = list(enumeration)[:16]
+        devices = [
+            {
+                "name": str(d.device_name),
+                "model": str(d.device_model),
+                "serial": str(d.serial_number),
+                "slot": int(d.slot_number),
+                "chassis": int(d.chassis_number),
+            }
+            for d in enumeration
+        ][:16]
+
     if not devices:
-        raise RuntimeError("No NI-SCOPE device found")
+        log.warning("No NI-SCOPE devices found")
+        return
+
     for device in devices:
-        # Keep the session alive; PSA applies the selected union settings before
-        # each acquisition rather than assuming every device has two channels.
-        session = niscope.Session(resource_name=device.device_name)
+        session = niscope.Session(resource_name=device["name"])
         try:
-            state.scopes.append(ScopeDevice(
-                name=str(device.device_name),
-                model=str(device.device_model),
-                channel_count=int(session.channel_count),
-                slot=int(device.slot_number),
-                chassis=int(device.chassis_number),
-                serial=str(device.serial_number),
-                native=session,
-            ))
+            state.scopes.append(
+                ScopeDevice(
+                    name=device["name"],
+                    model=device["model"],
+                    channel_count=int(session.channel_count),
+                    slot=device["slot"],
+                    chassis=device["chassis"],
+                    serial=device["serial"],
+                    native=session,
+                )
+            )
         except Exception:
             session.close()
             raise
 
 
 def init_hardware(*, mock: bool) -> int:
-    """Initialize mock state or discover/configure real NI DAQ and scope."""
+    """Initialize mock state or discover/configure real NI hardware."""
     global runtime
-    if runtime is not None:
-        runtime.close()
+
+    close_hardware()
     state = HardwareRuntime(mock=mock)
+
     if mock:
-        # mock時はNI SDKをimportせず、shellハンドラ内のインメモリ値を使う。
         log.info("[mock] Using deterministic simulated NI hardware")
         runtime = state
         _bind_shell_state(state)
         return 0
+
     try:
-        # 実機モードではここでNIタスクを直接列挙・初期化する。
         _open_scopes(state)
         _open_daq(state)
-        for group, tasks in state.daq.items():
-            for index, item in enumerate(tasks):
+
+        # Initialize outputs. Start only continuous AO tasks.
+        for group in ("AO", "DO"):
+            for index, item in enumerate(state.daq[group]):
                 write_daq(group, index, state=state)
-                if group == "DAO":
+
+                if group == "AO" and item.frequency > 0:
                     item.native.start()
                     item.running = True
+
         runtime = state
         _bind_shell_state(state)
+
         log.info(
-            "NI hardware ready: %d output task(s), %d niScope device(s)",
-            sum(map(len, state.daq.values())), len(state.scopes),
+            "NI hardware ready: AO=%d, AI=%d, DO=%d, DI=%d, scopes=%d",
+            len(state.daq["AO"]),
+            len(state.daq["AI"]),
+            len(state.daq["DO"]),
+            len(state.daq["DI"]),
+            len(state.scopes),
         )
         return 0
-    except Exception as exc:
+
+    except Exception:
         state.close()
-        log.error("! NI hardware initialization failed: %s", exc)
+        log.exception("NI hardware initialization failed")
         return -1
 
 
 def _bind_shell_state(state: HardwareRuntime) -> None:
-    """Expose discovered devices in the handler state used by shell commands."""
+    """Expose discovered devices to shell command handlers."""
     from nev.handlers import device_commands as handlers
+
     if state.mock:
         return
+
     handlers.TASKS = {
-        group: [handlers.Task(d.device_id, d.name, d.model, d.values, d.length, d.frequency, d.running)
-                for i, d in enumerate(items)]
+        group: [
+            handlers.Task(
+                d.device_id,
+                d.name,
+                d.model,
+                d.values,
+                d.length,
+                d.frequency,
+                d.running,
+            )
+            for d in items
+        ]
         for group, items in state.daq.items()
     }
+
     handlers.SCOPE_DEVICES = [
-        (d.name, d.model, d.channel_count, d.slot, d.chassis, d.serial)
+        (
+            d.name,
+            d.model,
+            d.channel_count,
+            d.slot,
+            d.chassis,
+            d.serial,
+        )
         for d in state.scopes
     ]
-    handlers.UNIONS = [handlers.ScopeUnion(devices=[0])] + [handlers.ScopeUnion() for _ in range(3)]
+
+    handlers.UNIONS = (
+        [handlers.ScopeUnion(devices=[0])]
+        + [handlers.ScopeUnion() for _ in range(3)]
+    )
+
     handlers.UNIONS[0].channels = {
         index: [(2.0, "DC") for _ in range(device.channel_count)]
         for index, device in enumerate(state.scopes[:1])
     }
 
 
-def write_daq(group: str, index: int, *, state: HardwareRuntime | None = None) -> None:
-    """Write stored values using static or per-channel waveform layout."""
+def write_daq(
+    group: str,
+    index: int,
+    *,
+    state: HardwareRuntime | None = None,
+) -> None:
+    """Write AO waveforms or digital output values."""
     runtime_ = state or get_runtime()
-    item = runtime_.daq[group][index]
+
+    if group not in ("AO", "DO"):
+        raise ValueError(
+            f"Cannot write to {group!r}; only AO and DO are writable"
+        )
+
+    items = runtime_.daq.get(group, [])
+    if not 0 <= index < len(items):
+        raise IndexError(f"Invalid {group} task index: {index}")
+
+    item = items[index]
     if item.native is None:
-        return
-    if group == "DAO":
-        width = len(item.channels)
-        rows = [item.values[i * item.length:(i + 1) * item.length] for i in range(width)]
-        item.native.write(rows, auto_start=False)
-    elif group == "SDO":
-        item.native.write([[bool(x)] for x in item.values], auto_start=True)
-    else:
-        item.native.write([[x] for x in item.values], auto_start=True)
+        raise RuntimeError(
+            f"{group} task {item.name} is not initialized"
+        )
+
+    if group == "AO":
+        expected = len(item.channels) * item.length
+        if len(item.values) != expected:
+            raise ValueError(
+                f"AO values length mismatch: expected {expected}, "
+                f"got {len(item.values)}"
+            )
+
+        if item.frequency > 0:
+            # NI-DAQmx multi-channel analog data is channel-major.
+            rows = [
+                item.values[i * item.length:(i + 1) * item.length]
+                for i in range(len(item.channels))
+            ]
+            item.native.write(rows, auto_start=False)
+        else:
+            values = [
+                item.values[i * item.length]
+                for i in range(len(item.channels))
+            ]
+            item.native.write(values, auto_start=True)
+
+    else:  # DO
+        if len(item.values) != len(item.channels):
+            raise ValueError(
+                f"DO values length mismatch: expected {len(item.channels)}, "
+                f"got {len(item.values)}"
+            )
+
+        item.native.write(
+            [bool(value) for value in item.values],
+            auto_start=True,
+        )
 
 
-def run_daq(index: int) -> None:
-    """Start DAO and AI together using the AI sample clock/start trigger."""
+def reconfigure_daq(group: str, index: int) -> None:
+    """Recreate a DAQ task after channels, length, or rate have changed."""
     runtime_ = get_runtime()
-    item = runtime_.daq["DAO"][index]
-    import nidaqmx
-    from nidaqmx.constants import AcquisitionType
 
-    # The regular DAO task created at initialization owns the same AO channels.
-    # Release it before creating the synchronized AI/AO pair.
+    if group not in DAQ_GROUPS:
+        raise ValueError(f"Unsupported DAQ group: {group}")
+
+    items = runtime_.daq.get(group, [])
+    if not 0 <= index < len(items):
+        raise IndexError(f"Invalid {group} task index: {index}")
+
+    item = items[index]
+
+    if group == "AI":
+        runtime_.ai_tasks.pop(index, None)
+
     if item.native is not None:
         try:
             if item.running:
                 item.native.stop()
         finally:
             item.native.close()
-        item.native = None
-    previous_ai = runtime_.ai_tasks.pop(index, None)
-    if previous_ai is not None:
-        try:
-            previous_ai.stop()
-        finally:
-            previous_ai.close()
-    runtime_.ai_data.pop(index, None)
+            item.native = None
+            item.running = False
 
-    ai_task = nidaqmx.Task(f"nev_AI_for_DAO_{index}")
-    ao_task = None
+    import nidaqmx
+    from nidaqmx.constants import AcquisitionType, LineGrouping
+
+    task = nidaqmx.Task(f"nev_{group}_{item.name}")
+
     try:
-        ao_task = nidaqmx.Task(f"nev_DAO_sync_{index}")
-        ai_task.ai_channels.add_ai_voltage_chan("PXI1Slot4/ai0")
-        ai_task.timing.cfg_samp_clk_timing(
-            rate=item.frequency,
-            sample_mode=AcquisitionType.CONTINUOUS,
-            samps_per_chan=item.length,
-        )
+        if group == "AO":
+            for channel in item.channels:
+                task.ao_channels.add_ao_voltage_chan(channel)
 
-        for channel in item.channels:
-            ao_task.ao_channels.add_ao_voltage_chan(channel)
-        ao_task.timing.cfg_samp_clk_timing(
-            rate=item.frequency,
-            source="/PXI1Slot4/te0/SampleClock",
-            sample_mode=AcquisitionType.CONTINUOUS,
-            samps_per_chan=item.length,
-        )
-        ao_task.triggers.start_trigger.cfg_dig_edge_start_trig(
-            "/PXI1Slot4/te0/StartTrigger"
-        )
+        elif group == "AI":
+            for channel in item.channels:
+                task.ai_channels.add_ai_voltage_chan(channel)
 
-        width = len(item.channels)
-        ao_data = [
-            item.values[channel * item.length:(channel + 1) * item.length]
-            for channel in range(width)
-        ]
-        ao_task.write(ao_data, auto_start=False)
+        elif group == "DO":
+            for channel in item.channels:
+                task.do_channels.add_do_chan(
+                    channel,
+                    line_grouping=LineGrouping.CHAN_PER_LINE,
+                )
 
-        # Start output first: it waits for the AI-exported clock/trigger route.
-        ao_task.start()
-        ai_task.start()
-        item.native = ao_task
-        item.running = True
-        runtime_.ai_tasks[index] = ai_task
+        elif group == "DI":
+            for channel in item.channels:
+                task.di_channels.add_di_chan(
+                    channel,
+                    line_grouping=LineGrouping.CHAN_PER_LINE,
+                )
+
+        if group in ("AO", "AI") and item.frequency > 0:
+            task.timing.cfg_samp_clk_timing(
+                rate=item.frequency,
+                sample_mode=AcquisitionType.CONTINUOUS,
+                samps_per_chan=item.length,
+            )
+
+        item.native = task
+
     except Exception:
-        ai_task.close()
-        if ao_task is not None:
-            ao_task.close()
-        reconfigure_daq("DAO", index)
+        task.close()
         raise
 
 
-def stop_daq(index: int) -> None:
-    """Stop synchronized AI/AO tasks, cache the last AI block, and restore AO."""
+def run_ai(index: int) -> None:
+    """Start the selected hardware-timed AI task."""
     runtime_ = get_runtime()
-    item = runtime_.daq["DAO"][index]
-    ai_task = runtime_.ai_tasks.pop(index, None)
-    try:
-        if ai_task is not None:
-            # Preserve the most recent block so GET AI also works after stop.
-            runtime_.ai_data[index] = [
-                float(value) for value in ai_task.read(
-                    number_of_samples_per_channel=item.length,
-                    timeout=max(1.0, item.length / item.frequency + 1.0),
-                )
-            ]
-            ai_task.stop()
-    finally:
-        if item.native is not None:
-            try:
-                item.native.stop()
-            except Exception:
-                pass
-            item.native.close()
-            item.native = None
-        if ai_task is not None:
-            ai_task.close()
-        item.running = False
-        # Recreate the ordinary output task so SET DAO can be used again.
-        reconfigure_daq("DAO", index)
+    items = runtime_.daq["AI"]
+
+    if not 0 <= index < len(items):
+        raise IndexError(f"Invalid AI task index: {index}")
+
+    item = items[index]
+
+    if item.frequency <= 0:
+        raise RuntimeError(
+            f"AI task {item.name} has no sample clock configured"
+        )
+
+    if item.native is None:
+        reconfigure_daq("AI", index)
+
+    if not item.running:
+        item.native.start()
+        item.running = True
+
+    runtime_.ai_tasks[index] = item.native
 
 
 def read_ai(index: int) -> list[float]:
-    """Read one AI block, or return the most recently cached block."""
+    """Read one AI block and return channel-major flattened samples."""
     runtime_ = get_runtime()
-    task = runtime_.ai_tasks.get(index)
-    if task is None:
-        if index in runtime_.ai_data:
-            return list(runtime_.ai_data[index])
-        raise RuntimeError("AI acquisition has not been started for this DAO task")
-    samples = task.read(
-        number_of_samples_per_channel=runtime_.daq["DAO"][index].length,
-        timeout=10.0,
-    )
-    # One configured AI channel: nidaqmx returns the channel's sample list.
-    runtime_.ai_data[index] = [float(sample) for sample in samples]
-    return list(runtime_.ai_data[index])
+    items = runtime_.daq["AI"]
 
+    if not 0 <= index < len(items):
+        raise IndexError(f"Invalid AI task index: {index}")
 
-def reconfigure_daq(group: str, index: int) -> None:
-    """Recreate a NI task after its channels, length, or rate have changed."""
-    runtime_ = get_runtime()
-    item = runtime_.daq[group][index]
-    if item.native is not None:
-        item.native.close()
-    import nidaqmx
-    from nidaqmx.constants import AcquisitionType, LineGrouping
-    task = nidaqmx.Task(f"nev_{group}_{item.name}")
-    if group == "SDO":
-        for channel in item.channels:
-            task.do_channels.add_do_chan(channel, line_grouping=LineGrouping.CHAN_PER_LINE)
+    item = items[index]
+
+    if item.native is None:
+        reconfigure_daq("AI", index)
+
+    if item.frequency > 0:
+        if not item.running:
+            run_ai(index)
+
+        samples = item.native.read(
+            number_of_samples_per_channel=item.length,
+            timeout=max(5.0, item.length / item.frequency + 1.0),
+        )
     else:
-        for channel in item.channels:
-            task.ao_channels.add_ao_voltage_chan(channel)
-        if group == "DAO":
-            task.timing.cfg_samp_clk_timing(item.frequency, sample_mode=AcquisitionType.CONTINUOUS, samps_per_chan=item.length)
-    item.native = task
-    item.running = False
+        samples = item.native.read(
+            number_of_samples_per_channel=1,
+            timeout=5.0,
+        )
+
+    if len(item.channels) == 1:
+        result = [float(x) for x in samples]
+    else:
+        result = [
+            float(x)
+            for channel_samples in samples
+            for x in channel_samples
+        ]
+
+    item.values = result
+    runtime_.ai_data[index] = list(result)
+    return result
+
+
+def stop_ai(index: int) -> None:
+    """Stop AI acquisition and cache a final block when available."""
+    runtime_ = get_runtime()
+    items = runtime_.daq["AI"]
+
+    if not 0 <= index < len(items):
+        raise IndexError(f"Invalid AI task index: {index}")
+
+    item = items[index]
+    task = runtime_.ai_tasks.pop(index, None)
+
+    if task is None:
+        return
+
+    try:
+        if item.frequency > 0 and item.running:
+            samples = task.read(
+                number_of_samples_per_channel=item.length,
+                timeout=max(1.0, item.length / item.frequency + 1.0),
+            )
+
+            if len(item.channels) == 1:
+                result = [float(x) for x in samples]
+            else:
+                result = [
+                    float(x)
+                    for channel_samples in samples
+                    for x in channel_samples
+                ]
+
+            item.values = result
+            runtime_.ai_data[index] = list(result)
+
+    finally:
+        try:
+            if item.running:
+                task.stop()
+        finally:
+            item.running = False
+
+
+def read_di(index: int) -> list[float]:
+    """Read the current state of each digital input line."""
+    runtime_ = get_runtime()
+    items = runtime_.daq["DI"]
+
+    if not 0 <= index < len(items):
+        raise IndexError(f"Invalid DI task index: {index}")
+
+    item = items[index]
+
+    if item.native is None:
+        reconfigure_daq("DI", index)
+
+    result = item.native.read()
+
+    if not isinstance(result, (list, tuple)):
+        result = [result]
+
+    values = [float(bool(value)) for value in result]
+    item.values = values
+    return values
 
 
 def configure_scope(union: Any) -> None:
     """Apply vertical ranges, sampling settings, and trigger to a scope union."""
     runtime_ = get_runtime()
     import niscope
-    for device_index in union.devices:
-        session = runtime_.scopes[device_index].native
-        defaults = [(2.0, "DC") for _ in range(runtime_.scopes[device_index].channel_count)]
-        for channel_index, (voltage_range, coupling) in enumerate(union.channels.get(device_index, defaults)):
-            session.channels[str(channel_index)].configure_vertical(range=voltage_range, coupling=getattr(niscope.VerticalCoupling, coupling))
-        session.configure_horizontal_timing(min_sample_rate=union.frequency, min_num_pts=union.length, ref_position=float(union.trigger[0]), num_records=1, enforce_realtime=True)
 
-    # Apply the selected trigger once device parameters are configured.
-    import niscope
+    for device_index in union.devices:
+        device = runtime_.scopes[device_index]
+        session = device.native
+        defaults = [(2.0, "DC") for _ in range(device.channel_count)]
+
+        for channel_index, (voltage_range, coupling) in enumerate(
+            union.channels.get(device_index, defaults)
+        ):
+            session.channels[str(channel_index)].configure_vertical(
+                range=voltage_range,
+                coupling=getattr(niscope.VerticalCoupling, coupling),
+            )
+
+        session.configure_horizontal_timing(
+            min_sample_rate=union.frequency,
+            min_num_pts=union.length,
+            ref_position=float(union.trigger[0]),
+            num_records=1,
+            enforce_realtime=True,
+        )
+
     trigger = union.trigger
     sessions = [runtime_.scopes[i].native for i in union.devices]
+
     if str(trigger[1]).upper() == "IMMEDIATE":
         for session in sessions:
             session.configure_trigger_immediate()
     elif sessions:
         master_index = int(trigger[3])
-        sessions[master_index].configure_trigger_edge(trigger_source=str(trigger[2]), level=float(trigger[4]), slope=getattr(niscope.TriggerSlope, str(trigger[5]).upper()), coupling=getattr(niscope.TriggerCoupling, str(trigger[6]).upper()))
+        sessions[master_index].configure_trigger_edge(
+            trigger_source=str(trigger[2]),
+            level=float(trigger[4]),
+            slope=getattr(
+                niscope.TriggerSlope, str(trigger[5]).upper()
+            ),
+            coupling=getattr(
+                niscope.TriggerCoupling, str(trigger[6]).upper()
+            ),
+        )
 
 
 def acquire_scope(union: Any) -> list[list[list[float]]]:
-    """Initiate synchronized scope sessions and return samples by device/channel."""
+    """Acquire scope waveforms by device and channel."""
     runtime_ = get_runtime()
     import niscope
     import nitclk
+
     sessions = [runtime_.scopes[i].native for i in union.devices]
     if not sessions:
         raise RuntimeError("niScope union has no configured devices")
+
     trigger = union.trigger
     for session in sessions:
         if str(trigger[1]).upper() == "IMMEDIATE":
             session.configure_trigger_immediate()
         else:
-            session.configure_trigger_edge(trigger_source=str(trigger[2]), level=float(trigger[4]), slope=getattr(niscope.TriggerSlope, str(trigger[5]).upper()), coupling=getattr(niscope.TriggerCoupling, str(trigger[6]).upper()))
+            session.configure_trigger_edge(
+                trigger_source=str(trigger[2]),
+                level=float(trigger[4]),
+                slope=getattr(
+                    niscope.TriggerSlope, str(trigger[5]).upper()
+                ),
+                coupling=getattr(
+                    niscope.TriggerCoupling, str(trigger[6]).upper()
+                ),
+            )
+
     if len(sessions) > 1:
         nitclk.configure_for_homogeneous_triggers(sessions)
         nitclk.synchronize(sessions)
-    results = []
-    if len(sessions) > 1:
-        # TClk starts the synchronized set; fetch each device's configured
-        # channels and requested record length after the common initiation.
         nitclk.initiate(sessions)
+
+    results = []
+
     for device_index, session in zip(union.devices, sessions):
-        defaults = [(2.0, "DC") for _ in range(runtime_.scopes[device_index].channel_count)]
-        channel_settings = union.channels.get(device_index, defaults)
-        channel_ids = tuple(str(index) for index in range(len(channel_settings)))
-        with session.initiate() if len(sessions) == 1 else nullcontext():
+        device = runtime_.scopes[device_index]
+        defaults = [(2.0, "DC") for _ in range(device.channel_count)]
+        settings = union.channels.get(device_index, defaults)
+        channel_ids = tuple(str(i) for i in range(len(settings)))
+
+        context = (
+            session.initiate()
+            if len(sessions) == 1
+            else nullcontext()
+        )
+
+        with context:
             waveforms = session.channels[channel_ids].fetch(
                 num_samples=union.length,
                 timeout=max(5.0, union.length / union.frequency + 1.0),
             )
+
         results.append([
-            [float(value) for value in next(
-                (waveform.samples for waveform in waveforms if waveform.channel == channel),
-                [],
-            )]
+            [
+                float(value)
+                for value in next(
+                    (
+                        waveform.samples
+                        for waveform in waveforms
+                        if waveform.channel == channel
+                    ),
+                    [],
+                )
+            ]
             for channel in channel_ids
         ])
+
     return results
 
 
 def abort_scope(union: Any) -> None:
-    """Abort acquisition on each device in a configured scope union."""
+    """Abort acquisition on each scope in a configured union."""
     state = get_runtime()
+
     for index in union.devices:
         state.scopes[index].native.abort()
 
 
 def daqmx_device_inventory() -> list[dict[str, Any]]:
-    """Read detailed physical-device properties directly from NI-DAQmx."""
+    """Read physical-device properties directly from NI-DAQmx."""
     from nidaqmx.system import System
 
     def channel_names(collection: Any) -> tuple[str, ...]:
-        """Normalize an NI channel collection to displayable names."""
         return tuple(str(name) for name in collection.channel_names)
 
     devices: list[dict[str, Any]] = []
+
     for device in System.local().devices:
-        # Devices without AI/AO capabilities still appear in the inventory.
         try:
             ai_channels = channel_names(device.ai_physical_chans)
         except Exception:
             ai_channels = ()
+
         try:
             ao_channels = channel_names(device.ao_physical_chans)
         except Exception:
             ao_channels = ()
+
         try:
-            terminals = tuple(str(terminal) for terminal in device.terminals)
+            do_lines = tuple(str(x.name) for x in device.do_lines)
+        except Exception:
+            do_lines = ()
+
+        try:
+            di_lines = tuple(str(x.name) for x in device.di_lines)
+        except Exception:
+            di_lines = ()
+
+        try:
+            terminals = tuple(str(x) for x in device.terminals)
             terminals_error = None
         except Exception as exc:
             terminals = ()
             terminals_error = str(exc)
+
         devices.append({
             "name": str(device.name),
             "product_type": str(device.product_type),
             "product_category": str(device.product_category),
-            "serial_number": str(getattr(device, "dev_serial_num", "")),
+            "serial_number": str(
+                getattr(device, "dev_serial_num", "")
+            ),
             "ai_channels": ai_channels,
             "ao_channels": ao_channels,
+            "do_lines": do_lines,
+            "di_lines": di_lines,
             "terminals": terminals,
             "terminals_error": terminals_error,
         })
+
     return devices
 
 
 def niscope_device_inventory() -> list[tuple[str, str, int, int, int, str]]:
-    """Enumerate NI-SCOPE identity fields with NI-ModInst at command time."""
+    """Enumerate NI-SCOPE identity and channel information."""
     import nimodinst
 
     runtime_ = get_runtime()
-    channel_counts = {device.name: device.channel_count for device in runtime_.scopes}
+    channel_counts = {
+        device.name: device.channel_count
+        for device in runtime_.scopes
+    }
+
     with nimodinst.Session("niscope") as enumeration:
-        # These are the properties exposed by the NI-ModInst example: device
-        # name, model, serial, slot, and chassis. Channel count comes from the
-        # already-open NI-SCOPE session for that same resource.
         return [
             (
                 str(device.device_name),
