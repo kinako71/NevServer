@@ -766,7 +766,8 @@ def configure_scope(union: Any) -> None:
 
     if len(sessions) > 1:
         nitclk.configure_for_homogeneous_triggers(sessions)
-        nitclk.synchronize(sessions)
+        # Match niTClk_Synchronize(..., minTClkPeriod=0.0) in the C backend.
+        nitclk.synchronize(sessions, min_tclk_period=0.0)
 
 
 def acquire_scope(union: Any, sample_offset: int = 0) -> list[list[list[float]]]:
