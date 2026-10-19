@@ -483,12 +483,9 @@ def _psa_data(args,c):
     spec=args[0]
     match=re.fullmatch(r"(\d+)(?:-(\d*)?)?",spec)
     if not match: return _error(c,"!INVALID_INDEX")
-    if match.group(2) == "":
-        c.sh_error_code(NEVSHELL_ERR_INDEX_EMPTY, None)
-        return -1
-    begin=int(match.group(1)); end=int(match.group(2)) if match.group(2) is not None else begin
+    begin=int(match.group(1)); end=int(match.group(2) or 0) if match.group(2) is not None else begin
     # In the C command, an explicit end index of zero means “latest”.
-    if match.group(2) == "0": end=len(PSA["values"])-1
+    if match.group(2) in ("", "0"): end=len(PSA["values"])-1
     if begin<0 or begin>=len(PSA["values"]) or end<0 or end>=len(PSA["values"]): return _error(c,"!INDEX_OUT_OF_RANGE")
     if _send(c,f"#PSADATA {begin} {end}\n") < 0: return -17
     for parameter,data in PSA["values"][begin:end+1]:
