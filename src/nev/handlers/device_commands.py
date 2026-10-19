@@ -373,7 +373,7 @@ def _scope_set(kind,args,c):
     return _ok(c)
 
 
-PSA = {"status":"INVALID","start":0.0,"stop":0.0,"steps":0,"skip":0,"values":[],"source":"AO","device":0,"channel":0,"union":0}
+PSA = {"status":"INVALID","start":0.0,"stop":0.0,"steps":0,"skip":0,"values":[],"source":"AO","device":0,"channel":0,"union":0,"parameter":0.0}
 _psa_cancel = threading.Event()
 
 
@@ -385,27 +385,35 @@ def _psa_set(args,c):
     try:
         union=int(args[0]); source=args[1].strip("[]"); device=int(args[2]); channel=int(args[3]); start=float(args[4]); stop=float(args[5]); steps=int(args[6]); skip=int(args[7])
     except (ValueError,IndexError): return _error(c,"!INVALID_VALUE")
-    width = (len(TASKS[source][device].values) // TASKS[source][device].length
-             if source == "AO" and source in TASKS and device < len(TASKS[source]) else 0)
-    if union not in range(4) or source != "AO" or device not in range(len(TASKS["AO"])) or channel not in range(width) or steps<=0 or skip<0:
+    source = source.upper()
+    tasks = TASKS.get(source, [])
+    width = (len(tasks[device].values) // tasks[device].length
+             if device in range(len(tasks)) and tasks[device].length > 0 else 0)
+    if (union not in range(len(UNIONS)) or source not in ("AO", "DO")
+            or device not in range(len(tasks)) or channel not in range(width)
+            or steps <= 0 or skip < 0 or not math.isfinite(start) or not math.isfinite(stop)):
         return _error(c,"!INVALID_SCAN_CONFIGURATION")
-    PSA.update(status="VALID",mode="PSA",start=start,stop=stop,steps=steps,skip=skip,values=[],source=source,device=device,channel=channel,union=union)
+    if not UNIONS[union].devices:
+        return _error(c,"!INVALID_SCAN_CONFIGURATION")
+    PSA.update(status="VALID",mode="PSA",start=start,stop=stop,steps=steps,skip=skip,values=[],source=source,device=device,channel=channel,union=union,parameter=start)
     PSA["error"]=""
     return _ok(c)
 
 
 def _psa_run(args,c):
-    """Run a configured scan synchronously in mock mode or in a worker thread."""
+    """Prepare scope hardware synchronously, then execute the scan asynchronously."""
     if PSA["status"] not in ("VALID","FAILED","HARVESTED","ABORTED"): return _error(c,"!PSA_NOT_READY")
     from nev.hardware.bootstrap import get_runtime
     _psa_cancel.clear()
     PSA["values"]=[]
-    if get_runtime().mock:
-        try: _execute_psa_scan()
-        except Exception as exc: return _error(c,f"!NISCOPE_API_ERROR({exc})")
-        if PSA["status"]=="FAILED": return _error(c,f"!NISCOPE_API_ERROR({PSA.get('error','')} )")
-        return _ok(c)
-    PSA["status"]="TRIGGERED"
+    PSA.update(values=[], parameter=PSA["start"], error="", status="TRIGGERED")
+    if not get_runtime().mock:
+        try:
+            from nev.hardware.bootstrap import configure_scope
+            configure_scope(UNIONS[PSA["union"]])
+        except Exception as exc:
+            PSA.update(status="FAILED", error=str(exc))
+            return _error(c,f"!NISCOPE_API_ERROR({exc})")
     threading.Thread(target=_execute_psa_scan, name="nev-psa", daemon=True).start()
     return _ok(c)
 
@@ -413,7 +421,7 @@ def _psa_run(args,c):
 def _execute_psa_scan():
     """Step the selected output through scan values and collect scope samples."""
     from nev.hardware.bootstrap import (
-        acquire_scope, configure_scope, get_runtime,
+        acquire_scope, get_runtime,
         reconfigure_daq, write_daq,
     )
     runtime = get_runtime()
@@ -421,32 +429,43 @@ def _execute_psa_scan():
     count=PSA["steps"]+1
     union=UNIONS[PSA["union"]]
     try:
-        if not runtime.mock:
-            configure_scope(union)
         for i in range(count):
             if _psa_cancel.is_set():
                 PSA["status"]="ABORTED"
                 return
-            parameter=PSA["start"]+(PSA["stop"]-PSA["start"])*i/PSA["steps"]
+            parameter=PSA["parameter"]
             offset=PSA["channel"]*task.length
-            if task.length > 1:
-                task.values[offset:offset + task.length] = [parameter] * task.length
+            if PSA["source"] == "DO":
+                value = float(int(parameter) & 0xff)
+                task.values[offset:offset + task.length] = [value] * task.length
             else:
-                task.values[offset]=parameter
+                task.values[offset:offset + task.length] = [parameter] * task.length
             if not runtime.mock:
-                if task.frequency > 0:
-                    reconfigure_daq("AO",PSA["device"])
-                    write_daq("AO",PSA["device"])
+                PSA["status"]="PLANTED"
+                if PSA["source"] == "AO" and task.frequency > 0:
+                    reconfigure_daq("AO", PSA["device"])
+                    write_daq("AO", PSA["device"])
                     runtime.daq["AO"][PSA["device"]].native.start()
                     runtime.daq["AO"][PSA["device"]].running = True
-                    task.running=True
+                    task.running = True
                 else:
-                    write_daq("AO",PSA["device"])
-                samples=acquire_scope(union)
-                samples=[[channel[PSA["skip"]:] for channel in device] for device in samples]
+                    write_daq(PSA["source"], PSA["device"])
+                samples=acquire_scope(union, sample_offset=PSA["skip"])
             else:
-                samples=[[math.sin(i*.1+j*.01) for j in range(max(1,union.length-PSA["skip"]))]]
+                PSA["status"]="PLANTED"
+                samples = [
+                    [
+                        [math.sin(i * .1 + channel * .01 + j * .001)
+                         for j in range(PSA["skip"], PSA["skip"] + union.length)]
+                        for channel in range(SCOPE_DEVICES[device_index][2])
+                    ]
+                    for device_index in union.devices
+                ]
+            PSA["status"]="READY"
             PSA["values"].append((parameter,samples))
+            if i + 1 < count:
+                PSA["parameter"] = PSA["start"] + (PSA["stop"] - PSA["start"]) * (i + 1) / PSA["steps"]
+                PSA["status"]="TRIGGERED"
     except Exception as exc:
         PSA["status"]="ABORTED" if _psa_cancel.is_set() else "FAILED"
         PSA["error"]=str(exc)
@@ -457,11 +476,19 @@ def _execute_psa_scan():
 def _psa_data(args,c):
     """Return one or more acquired parameter/sample sets."""
     if PSA["status"]=="INVALID": return _error(c,"!PSA_NOT_READY")
-    spec=args[0] if args else "0-"
+    if not args:
+        c.sh_error_code(NEVSHELL_ERR_INDEX_EMPTY, None)
+        return -1
+    spec=args[0]
     match=re.fullmatch(r"(\d+)(?:-(\d*)?)?",spec)
     if not match: return _error(c,"!INVALID_INDEX")
-    begin=int(match.group(1)); end=int(match.group(2)) if match.group(2) else (len(PSA["values"])-1 if match.group(2) is not None else begin)
-    if begin<0 or end<begin or end>=len(PSA["values"]): return _error(c,"!INDEX_OUT_OF_RANGE")
+    if match.group(2) == "":
+        c.sh_error_code(NEVSHELL_ERR_INDEX_EMPTY, None)
+        return -1
+    begin=int(match.group(1)); end=int(match.group(2)) if match.group(2) is not None else begin
+    # In the C command, an explicit end index of zero means “latest”.
+    if match.group(2) == "0": end=len(PSA["values"])-1
+    if begin<0 or begin>=len(PSA["values"]) or end<0 or end>=len(PSA["values"]): return _error(c,"!INDEX_OUT_OF_RANGE")
     if _send(c,f"#PSADATA {begin} {end}\n") < 0: return -17
     for parameter,data in PSA["values"][begin:end+1]:
         if _send(c,f"{parameter:f}\n")<0: return -17
@@ -474,7 +501,7 @@ def _psa_data(args,c):
 def _psa_stat(args,c):
     """Report scan progress, current parameter, state, and any scan error."""
     status={"INVALID":"UNCONFIGURED","FAILED":"FAILED","VALID":"IDLE","TRIGGERED":"RUNNING","PLANTED":"RUNNING","READY":"RUNNING","HARVESTED":"COMPLETE","ABORTED":"ABORTED"}[PSA["status"]]
-    current=PSA["values"][-1][0] if PSA["values"] else PSA["start"]
+    current=PSA["parameter"]
     error=f" {PSA.get('error','')}" if PSA["status"]=="FAILED" else ""
     return _ok(c,f"#PSASTAT\n{len(PSA['values'])} {current:f} {status}{error}\n")
 
@@ -483,8 +510,8 @@ def _psa_stop(args,c):
     """Request scan cancellation and abort the active real scope acquisition."""
     if PSA["status"]=="INVALID": return _error(c,"!NO_PSA_TO_STOP")
     from nev.hardware.bootstrap import abort_scope, get_runtime
+    _psa_cancel.set()
     if not get_runtime().mock:
-        _psa_cancel.set()
         abort_scope(UNIONS[PSA["union"]])
     PSA["status"]="ABORTED"
     return _ok(c)

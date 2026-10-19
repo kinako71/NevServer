@@ -693,6 +693,7 @@ def configure_scope(union: Any) -> None:
     """Apply vertical ranges, sampling settings, and trigger to a scope union."""
     runtime_ = get_runtime()
     import niscope
+    import nitclk
 
     for device_index in union.devices:
         device = runtime_.scopes[device_index]
@@ -717,26 +718,59 @@ def configure_scope(union: Any) -> None:
 
     trigger = union.trigger
     sessions = [runtime_.scopes[i].native for i in union.devices]
-
-    if str(trigger[1]).upper() == "IMMEDIATE":
-        for session in sessions:
-            session.configure_trigger_immediate()
-    elif sessions:
+    if sessions:
         master_index = int(trigger[3])
-        sessions[master_index].configure_trigger_edge(
-            trigger_source=str(trigger[2]),
-            level=float(trigger[4]),
-            slope=getattr(
-                niscope.TriggerSlope, str(trigger[5]).upper()
-            ),
-            coupling=getattr(
-                niscope.TriggerCoupling, str(trigger[6]).upper()
-            ),
-        )
+        if not 0 <= master_index < len(sessions):
+            raise ValueError("invalid NI-SCOPE trigger device index")
+        session = sessions[master_index]
+        trigger_type = str(trigger[1]).upper()
+        trigger_type = {
+            "0": "EDGE", "1": "HYSTERESIS", "2": "DIGITAL",
+            "3": "WINDOW", "4": "IMMEDIATE", "5": "SOFTWARE",
+        }.get(trigger_type, trigger_type)
+        trigger_source = str(trigger[2])
+        slope = getattr(niscope.TriggerSlope, str(trigger[5]).upper())
+        coupling = getattr(niscope.TriggerCoupling, str(trigger[6]).upper())
+        holdoff, delay = float(trigger[7]), float(trigger[8])
+
+        if trigger_type == "IMMEDIATE":
+            session.configure_trigger_immediate()
+        elif trigger_type == "EDGE":
+            session.configure_trigger_edge(
+                trigger_source=trigger_source, level=float(trigger[4]),
+                trigger_coupling=coupling, slope=slope,
+                holdoff=holdoff, delay=delay,
+            )
+        elif trigger_type == "HYSTERESIS":
+            session.configure_trigger_hysteresis(
+                trigger_source=trigger_source, level=float(trigger[4]),
+                hysteresis=0.0, trigger_coupling=coupling, slope=slope,
+                holdoff=holdoff, delay=delay,
+            )
+        elif trigger_type == "DIGITAL":
+            session.configure_trigger_digital(
+                trigger_source=trigger_source, slope=slope,
+                holdoff=holdoff, delay=delay,
+            )
+        elif trigger_type == "WINDOW":
+            session.configure_trigger_window(
+                trigger_source=trigger_source, low_level=0.0,
+                high_level=float(trigger[4]),
+                window_mode=niscope.TriggerWindowMode.ENTERING,
+                trigger_coupling=coupling, holdoff=holdoff, delay=delay,
+            )
+        elif trigger_type == "SOFTWARE":
+            session.configure_trigger_software(holdoff=holdoff, delay=delay)
+        else:
+            raise ValueError(f"unknown NI-SCOPE trigger type: {trigger[1]}")
+
+    if len(sessions) > 1:
+        nitclk.configure_for_homogeneous_triggers(sessions)
+        nitclk.synchronize(sessions)
 
 
-def acquire_scope(union: Any) -> list[list[list[float]]]:
-    """Acquire scope waveforms by device and channel."""
+def acquire_scope(union: Any, sample_offset: int = 0) -> list[list[list[float]]]:
+    """Acquire waveforms using the C implementation's pretrigger offset."""
     runtime_ = get_runtime()
     import niscope
     import nitclk
@@ -745,25 +779,7 @@ def acquire_scope(union: Any) -> list[list[list[float]]]:
     if not sessions:
         raise RuntimeError("niScope union has no configured devices")
 
-    trigger = union.trigger
-    for session in sessions:
-        if str(trigger[1]).upper() == "IMMEDIATE":
-            session.configure_trigger_immediate()
-        else:
-            session.configure_trigger_edge(
-                trigger_source=str(trigger[2]),
-                level=float(trigger[4]),
-                slope=getattr(
-                    niscope.TriggerSlope, str(trigger[5]).upper()
-                ),
-                coupling=getattr(
-                    niscope.TriggerCoupling, str(trigger[6]).upper()
-                ),
-            )
-
     if len(sessions) > 1:
-        nitclk.configure_for_homogeneous_triggers(sessions)
-        nitclk.synchronize(sessions)
         nitclk.initiate(sessions)
 
     results = []
@@ -783,6 +799,8 @@ def acquire_scope(union: Any) -> list[list[list[float]]]:
         with context:
             waveforms = session.channels[channel_ids].fetch(
                 num_samples=union.length,
+                relative_to=niscope.FetchRelativeTo.PRETRIGGER,
+                offset=sample_offset,
                 timeout=max(5.0, union.length / union.frequency + 1.0),
             )
 
