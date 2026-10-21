@@ -66,7 +66,13 @@ def build_command_tree() -> CommandNode:
         literal="PSA",
         children=[com_get_psa_ns, com_get_psa_daq],
     )
-    com_get_prc = CommandNode(literal="PRC", handler=prc.get_prc)
+    com_get_prc = CommandNode(
+        literal="PRC",
+        children=[
+            CommandNode(literal="DATA", handler=prc.get_prc_data),
+            CommandNode(literal="STAT", handler=prc.get_prc_stat),
+        ],
+    )
 
     com_get_nsu_num = CommandNode(literal="NUM", handler=S("GET NSU NUM"))
     com_get_nsu_devs = CommandNode(literal="DEVS", handler=S("GET NSU DEVS"))

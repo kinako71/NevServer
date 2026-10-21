@@ -6,7 +6,7 @@ from __future__ import annotations
 import logging
 from contextlib import nullcontext
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 
 log = logging.getLogger(__name__)
 
@@ -803,6 +803,9 @@ def acquire_prc_series(
     threshold_mv: float,
     pulse_width_ms: float,
     pulse_amplitude_mv: float,
+    progress_callback: Callable[
+        [float, list[float] | None, list[float] | None], None
+    ] | None = None,
 ) -> list[dict[str, float]]:
     """Measure threshold-crossing timing changes for each AO pulse phase.
 
@@ -872,6 +875,8 @@ def acquire_prc_series(
         max_phase = max(phases_ms, default=1.0)
         series = []
         for phase_ms in phases_ms:
+            if progress_callback is not None:
+                progress_callback(phase_ms, None, None)
             phase_response = 0.002 * math.sin(
                 math.pi * phase_ms / max(max_phase, 1.0)
             ) * (pulse_width_ms / 4.0) * (pulse_amplitude_mv / 100.0)
@@ -881,6 +886,8 @@ def acquire_prc_series(
             ]
             periods = [0.05 + (trial - (repeats - 1) / 2) * 1e-6
                        for trial in range(repeats)]
+            if progress_callback is not None:
+                progress_callback(phase_ms, changes, periods)
             series.append({"phase_ms": phase_ms, "changes": changes, "periods": periods})
         return series
 
@@ -911,6 +918,8 @@ def acquire_prc_series(
         route_connected = True
 
         for phase_ms in phases_ms:
+            if progress_callback is not None:
+                progress_callback(phase_ms, None, None)
             delay_samples = round(phase_ms * ao_rate / 1000.0)
             ao_data = (
                 [baseline] * delay_samples
@@ -986,6 +995,8 @@ def acquire_prc_series(
                 "changes": changes,
                 "periods": periods,
             })
+            if progress_callback is not None:
+                progress_callback(phase_ms, changes, periods)
         return results
     finally:
         if route_connected:

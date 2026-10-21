@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import re
 import threading
 
 from nev.shell import datareq
@@ -20,6 +21,7 @@ PRC = {
     "pulse_width_ms": 4.0,
     "pulse_amplitude_mv": 100.0,
     "phases_ms": [],
+    "current_parameter": 0.0,
     "results": [],
     "error": "",
 }
@@ -59,6 +61,7 @@ def set_prc(args: list[str], connection: ShellConnection) -> int:
         duration_ms=0.0, phase_step_ms=0.0, repeats=0,
         threshold_mv=0.0, pulse_width_ms=0.0, pulse_amplitude_mv=0.0,
         phases_ms=[], results=[], error="",
+        current_parameter=0.0,
     )
     _finished.clear()
     if datareq.set_stream_req("r", _receive_scan_settings) < 0:
@@ -108,6 +111,7 @@ def _receive_scan_settings(buffer: str, connection: object) -> tuple[int, int]:
             phase_step_ms=phase_step_ms,
             repeats=repeats,
             phases_ms=phases,
+            current_parameter=phases[0],
             status="RECEIVING_PULSE",
         )
     elif PRC["status"] == "RECEIVING_PULSE":
@@ -143,13 +147,51 @@ def run_prc(args: list[str], connection: ShellConnection) -> int:
 
     from nev.hardware.bootstrap import acquire_prc_series
 
-    PRC.update(status="RUNNING", results=[], error="")
+    PRC.update(
+        status="RUNNING", results=[], error="",
+        current_parameter=PRC["phases_ms"][0],
+    )
     _finished.clear()
 
     def acquire() -> None:
         """Acquire phase points and retain the metrics until the next setup."""
+        def update_progress(
+            phase_ms: float,
+            changes: list[float] | None,
+            periods: list[float] | None,
+        ) -> None:
+            """Expose the current phase and append each completed phase."""
+            PRC["current_parameter"] = phase_ms
+            if changes is None or periods is None:
+                return
+            valid_changes = [value for value in changes if math.isfinite(value)]
+            valid_periods = [value for value in periods if math.isfinite(value)]
+            mean_change = sum(valid_changes) / len(valid_changes) if valid_changes else math.nan
+            mean_period = sum(valid_periods) / len(valid_periods) if valid_periods else math.nan
+            variance_change = (
+                sum((value - mean_change) ** 2 for value in valid_changes) / (len(valid_changes) - 1)
+                if len(valid_changes) >= 2 else math.nan
+            )
+            variance_period = (
+                sum((value - mean_period) ** 2 for value in valid_periods) / (len(valid_periods) - 1)
+                if len(valid_periods) >= 2 else math.nan
+            )
+            response = (
+                (mean_period - mean_change) / mean_period
+                if math.isfinite(mean_period) and mean_period != 0
+                and math.isfinite(mean_change) else math.nan
+            )
+            PRC["results"].append({
+                "phase_ms": phase_ms,
+                "mean_change": mean_change,
+                "variance_change": variance_change,
+                "mean_period": mean_period,
+                "variance_period": variance_period,
+                "prc": response,
+            })
+
         try:
-            measurements = acquire_prc_series(
+            acquire_prc_series(
                 ao_task_index=PRC["ao_task"],
                 ao_channel_index=PRC["ao_channel"],
                 phases_ms=list(PRC["phases_ms"]),
@@ -157,38 +199,12 @@ def run_prc(args: list[str], connection: ShellConnection) -> int:
                 threshold_mv=PRC["threshold_mv"],
                 pulse_width_ms=PRC["pulse_width_ms"],
                 pulse_amplitude_mv=PRC["pulse_amplitude_mv"],
+                progress_callback=update_progress,
             )
-            results = []
-            for measurement in measurements:
-                changes = [value for value in measurement["changes"] if math.isfinite(value)]
-                periods = [value for value in measurement["periods"] if math.isfinite(value)]
-                mean_change = sum(changes) / len(changes) if changes else math.nan
-                mean_period = sum(periods) / len(periods) if periods else math.nan
-                variance_change = (
-                    sum((value - mean_change) ** 2 for value in changes) / (len(changes) - 1)
-                    if len(changes) >= 2 else math.nan
-                )
-                variance_period = (
-                    sum((value - mean_period) ** 2 for value in periods) / (len(periods) - 1)
-                    if len(periods) >= 2 else math.nan
-                )
-                response = (
-                    (mean_period - mean_change) / mean_period
-                    if math.isfinite(mean_period) and mean_period != 0
-                    and math.isfinite(mean_change) else math.nan
-                )
-                results.append({
-                    "phase_ms": measurement["phase_ms"],
-                    "mean_change": mean_change,
-                    "variance_change": variance_change,
-                    "mean_period": mean_period,
-                    "variance_period": variance_period,
-                    "prc": response,
-                })
         except Exception as exc:
             PRC.update(status="FAILED", error=str(exc))
         else:
-            PRC.update(status="COMPLETE", results=results, error="")
+            PRC.update(status="COMPLETE", error="")
         finally:
             _finished.set()
 
@@ -196,23 +212,55 @@ def run_prc(args: list[str], connection: ShellConnection) -> int:
     return connection.sh_term()
 
 
-def get_prc(args: list[str], connection: ShellConnection) -> int:
-    """Wait for the scan, then return PRC metrics for each tested phase."""
-    if args:
-        return connection.sh_error("!INVALID_PRC_CONFIGURATION")
-    if PRC["status"] == "RUNNING":
-        _finished.wait()
-    if PRC["status"] == "FAILED":
-        return connection.sh_error(f"!PRC_API_ERROR({PRC['error']})")
-    if PRC["status"] != "COMPLETE":
+def get_prc_data(args: list[str], connection: ShellConnection) -> int:
+    """Return scalar PRC values for a requested phase-point range."""
+    if len(args) != 1:
+        return connection.sh_error("!PRC_POINT_NOT_GIVEN")
+    if not PRC["results"]:
+        if PRC["status"] == "FAILED":
+            return connection.sh_error(f"!PRC_API_ERROR({PRC['error']})")
         return connection.sh_error("!PRC_DATA_UNAVAILABLE")
 
-    if connection.send_text(f"#PRC {len(PRC['results'])}\n") < 0:
+    match = re.fullmatch(r"(\d+)(?:-(\d*))?", args[0])
+    if match is None:
+        return connection.sh_error("!INVALID_INDEX")
+    begin = int(match.group(1))
+    if match.group(2) is None:
+        end = begin
+    elif match.group(2) == "":
+        end = len(PRC["results"]) - 1
+    else:
+        end = int(match.group(2))
+    if begin < 0 or begin >= len(PRC["results"]) or end < begin or end >= len(PRC["results"]):
+        return connection.sh_error("!INDEX_OUT_OF_RANGE")
+
+    if connection.send_text(f"#PSADATA {begin} {end}\n") < 0:
         return -17
-    for result in PRC["results"]:
+    for result in PRC["results"][begin:end + 1]:
         if connection.send_text(
-            "{phase_ms:f} {mean_change:f} {variance_change:f} "
-            "{mean_period:f} {variance_period:f} {prc:f}\n".format(**result)
+            f"{result['phase_ms']:f}\n[{result['prc']:f}]\n"
         ) < 0:
             return -17
     return connection.sh_term()
+
+
+def get_prc_stat(args: list[str], connection: ShellConnection) -> int:
+    """Report available phase points, active phase, and workflow status."""
+    if args:
+        return connection.sh_error("!INVALID_PRC_CONFIGURATION")
+    status = {
+        "UNCONFIGURED": "UNKNOWN",
+        "RECEIVING_TIMING": "CONFIGURED",
+        "RECEIVING_PULSE": "CONFIGURED",
+        "READY": "IDLE",
+        "RUNNING": "RUNNING",
+        "COMPLETE": "COMPLETE",
+        "FAILED": "FAILED",
+        "ABORTED": "ABORTED",
+    }.get(PRC["status"], "UNKNOWN")
+    error = f" {PRC['error']}" if status == "FAILED" and PRC["error"] else ""
+    response = (
+        f"#PSASTAT\n{len(PRC['results'])} "
+        f"{PRC['current_parameter']:f} {status}{error}\n"
+    )
+    return connection.sh_term(response)
