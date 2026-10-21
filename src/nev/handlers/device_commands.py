@@ -374,6 +374,8 @@ def _scope_set(kind,args,c):
 
 
 PSA = {"status":"INVALID","start":0.0,"stop":0.0,"steps":0,"skip":0,"values":[],"source":"AO","device":0,"channel":0,"union":0,"parameter":0.0}
+# Keep the future DAQmx acquisition path separate from the NI-SCOPE PSA state.
+PSA_DAQ = {"status":"INVALID","parameter":0.0,"values":[],"error":""}
 _psa_cancel = threading.Event()
 
 
@@ -504,6 +506,45 @@ def _psa_stat(args,c):
     return _ok(c,f"#PSASTAT\n{len(PSA['values'])} {current:f} {status}{error}\n")
 
 
+def _psa_daq_data(args,c):
+    """Return acquired waveform data from the independent DAQmx PSA state."""
+    if PSA_DAQ["status"] == "INVALID":
+        return _error(c, "!PSA_DAQ_NOT_READY")
+    if not args:
+        c.sh_error_code(NEVSHELL_ERR_INDEX_EMPTY, None)
+        return -1
+    match = re.fullmatch(r"(\d+)(?:-(\d*)?)?", args[0])
+    if not match:
+        return _error(c, "!INVALID_INDEX")
+    begin = int(match.group(1))
+    end = int(match.group(2) or 0) if match.group(2) is not None else begin
+    if match.group(2) in ("", "0"):
+        end = len(PSA_DAQ["values"]) - 1
+    if begin >= len(PSA_DAQ["values"]) or end < 0 or end >= len(PSA_DAQ["values"]):
+        return _error(c, "!INDEX_OUT_OF_RANGE")
+    if _send(c, f"#PSADAQDATA {begin} {end}\n") < 0:
+        return -17
+    for parameter, devices in PSA_DAQ["values"][begin:end + 1]:
+        if _send(c, f"{parameter:f}\n") < 0:
+            return -17
+        for device in devices:
+            for channel in device:
+                if _send(c, "[" + " ".join(f"{value:f}" for value in channel) + "]\n") < 0:
+                    return -17
+    return _ok(c)
+
+
+def _psa_daq_stat(args,c):
+    """Report progress for the independent DAQmx PSA workflow."""
+    status = {
+        "INVALID":"UNCONFIGURED", "FAILED":"FAILED", "VALID":"IDLE",
+        "TRIGGERED":"RUNNING", "PLANTED":"RUNNING", "READY":"RUNNING",
+        "HARVESTED":"COMPLETE", "ABORTED":"ABORTED",
+    }.get(PSA_DAQ["status"], "UNCONFIGURED")
+    error = f" {PSA_DAQ['error']}" if PSA_DAQ["status"] == "FAILED" else ""
+    return _ok(c, f"#PSADAQSTAT\n{len(PSA_DAQ['values'])} {PSA_DAQ['parameter']:f} {status}{error}\n")
+
+
 def _psa_stop(args,c):
     """Request scan cancellation and abort the active real scope acquisition."""
     if PSA["status"]=="INVALID": return _error(c,"!NO_PSA_TO_STOP")
@@ -557,7 +598,9 @@ def handler_for(name: str) -> Callable[[list[str], ShellConnection], int]:
         "SET NSU DEVS":lambda a,c:_scope_set("DEVS",a,c),"SET NSU CHAN":lambda a,c:_scope_set("CHAN",a,c),
         "SET NSU DLEN":lambda a,c:_scope_set("DLEN",a,c),"SET NSU FREQ":lambda a,c:_scope_set("FREQ",a,c),
         "SET NSU TRIG":lambda a,c:_scope_set("TRIG",a,c),"SET PSA":_psa_set,"RUN PSA":_psa_run,
-        "GET PSA DATA":_psa_data,"GET PSA STAT":_psa_stat,"STOP PSA":_psa_stop,
+        "GET PSA NS DATA":_psa_data,"GET PSA NS STAT":_psa_stat,
+        "GET PSA DAQ DATA":_psa_daq_data,"GET PSA DAQ STAT":_psa_daq_stat,
+        "STOP PSA":_psa_stop,
         "SET PRC":_prc_set,"RUN PRC":_prc_run,"GET PRC":_prc_get,
     }
     try: handler=table[name]

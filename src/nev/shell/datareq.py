@@ -20,6 +20,12 @@ class DataRequest:
     level: int = 0
     proc: Callable[[object | None], int] | None = None
     proc_arg: object | None = None
+    stream_receiver: Callable[[str, object], tuple[int, int]] | None = None
+
+    @property
+    def active(self) -> bool:
+        """Whether this request is receiving numeric data or a custom stream."""
+        return self.data is not None or self.stream_receiver is not None
 
 
 data_req_recv = DataRequest()
@@ -74,6 +80,20 @@ def set_data_req(
         data_req_recv = target
     else:
         data_req_send = target
+    return 0
+
+
+def set_stream_req(
+    direction: str,
+    receiver: Callable[[str, object], tuple[int, int]],
+) -> int:
+    """Register a line-framed custom receive stream such as SET PULSE."""
+    global data_req_recv, data_req_send
+    if direction != "r":
+        return -2
+    if data_req_recv.active:
+        return -1
+    data_req_recv = DataRequest(stream_receiver=receiver)
     return 0
 
 

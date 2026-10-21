@@ -625,6 +625,167 @@ def read_ai(index: int) -> list[float]:
     return result
 
 
+def acquire_pulse(
+    *,
+    ao_task_index: int,
+    ao_channel_index: int,
+    sample_rate: float,
+    duration: float,
+    delay_ms: float,
+    width_ms: float,
+    amplitude_mv: float,
+) -> dict[str, list[float]]:
+    """Generate one AO pulse and acquire the synchronized AI waveform.
+
+    Mock mode creates predictable data. Real mode temporarily releases the
+    selected AO/AI devices' long-lived tasks, runs finite triggered tasks, and
+    restores their prior task configuration and running state afterwards.
+    """
+    import math
+
+    runtime_ = get_runtime()
+    if runtime_.mock:
+        from nev.handlers import device_commands
+
+        ao_tasks = device_commands.TASKS["AO"]
+        ai_tasks = device_commands.TASKS["AI"]
+    else:
+        ao_tasks = runtime_.daq["AO"]
+        ai_tasks = runtime_.daq["AI"]
+    if not ao_tasks or not ai_tasks:
+        raise RuntimeError("Pulse acquisition requires both AO and AI devices")
+    if not 0 <= ao_task_index < len(ao_tasks):
+        raise IndexError(f"Invalid AO task index: {ao_task_index}")
+    if ao_channel_index < 0:
+        raise IndexError(f"Invalid AO channel number: {ao_channel_index}")
+
+    ao_item = ao_tasks[ao_task_index]
+    ai_item = ai_tasks[0]
+    ao_channel = f"ao{ao_channel_index}"
+    if not runtime_.mock:
+        matches = [
+            channel for channel in ao_item.channels
+            if channel.rsplit("/", 1)[-1].lower() == ao_channel.lower()
+        ]
+        if not matches:
+            raise ValueError(f"AO channel {ao_channel} is not on {ao_item.name}")
+        ao_channel = matches[0]
+        if not ai_item.channels:
+            raise RuntimeError("AI task 0 has no configured channels")
+        ai_channel = ai_item.channels[0]
+        ao_value_index = ao_item.channels.index(ao_channel)
+    else:
+        # Mock task values are channel-major too. If the fixture does not
+        # include this high physical channel number, use its default 0 V value.
+        ao_value_index = ao_channel_index
+
+    count = round(sample_rate * duration)
+    if count < 1:
+        raise ValueError("Acquisition must contain at least one sample")
+    delay_samples = round(delay_ms * sample_rate / 1000.0)
+    width_samples = max(1, round(width_ms * sample_rate / 1000.0))
+    pulse_voltage = amplitude_mv / 1000.0
+    # Preserve the selected channel's configured starting value before and
+    # after the pulse instead of forcing the Pulse_Stimulus.py 0.28 V baseline.
+    value_offset = ao_value_index * ao_item.length
+    baseline = (
+        float(ao_item.values[value_offset])
+        if value_offset < len(ao_item.values)
+        else 0.0
+    )
+    ao_values = [baseline] * count
+    pulse_end = min(count, delay_samples + width_samples)
+    for sample in range(min(count, delay_samples), pulse_end):
+        ao_values[sample] = pulse_voltage
+    times = [sample / sample_rate for sample in range(count)]
+
+    if runtime_.mock:
+        # Synthetic response: baseline noise plus a small pulse-shaped signal.
+        ai_values = [
+            0.01 * math.sin(2.0 * math.pi * 50.0 * time_s)
+            + (0.05 if delay_samples <= i < pulse_end else 0.0)
+            for i, time_s in enumerate(times)
+        ]
+        return {"time": times, "ao": ao_values, "ai": ai_values}
+
+    import nidaqmx
+    from nidaqmx.constants import AcquisitionType, Edge, Signal
+
+    # The normal runtime keeps full-device tasks open. Release them while the
+    # one-channel finite tasks claim the same physical channels.
+    was_ao_running = ao_item.running
+    was_ai_running = ai_item.running
+    runtime_.ai_tasks.pop(0, None)
+    for item in (ao_item, ai_item):
+        if item.native is not None:
+            try:
+                if item.running:
+                    item.native.stop()
+            finally:
+                item.native.close()
+                item.native = None
+                item.running = False
+
+    pulse_ao_task = nidaqmx.Task()
+    pulse_ai_task = nidaqmx.Task()
+    try:
+        trigger = f"/{ao_item.name}/PXI_Trig0"
+        pulse_ai_task.ai_channels.add_ai_voltage_chan(
+            ai_channel, min_val=-10.0, max_val=10.0
+        )
+        pulse_ai_task.timing.cfg_samp_clk_timing(
+            rate=sample_rate,
+            sample_mode=AcquisitionType.FINITE,
+            samps_per_chan=count,
+        )
+        pulse_ai_task.triggers.start_trigger.cfg_dig_edge_start_trig(
+            trigger_source=trigger,
+            trigger_edge=Edge.RISING,
+        )
+
+        pulse_ao_task.ao_channels.add_ao_voltage_chan(
+            ao_channel, min_val=-10.0, max_val=10.0
+        )
+        pulse_ao_task.timing.cfg_samp_clk_timing(
+            rate=sample_rate,
+            sample_mode=AcquisitionType.FINITE,
+            samps_per_chan=count,
+        )
+        pulse_ao_task.export_signals.export_signal(
+            signal_id=Signal.START_TRIGGER,
+            output_terminal=trigger,
+        )
+        pulse_ao_task.write(ao_values, auto_start=False)
+
+        # Arm AI first so it is waiting when AO exports its start trigger.
+        pulse_ai_task.start()
+        pulse_ao_task.start()
+        ai_values = pulse_ai_task.read(
+            number_of_samples_per_channel=count,
+            timeout=max(30.0, duration + 5.0),
+        )
+        pulse_ao_task.wait_until_done(timeout=max(10.0, duration + 5.0))
+        return {
+            "time": times,
+            "ao": ao_values,
+            "ai": [float(value) for value in ai_values],
+        }
+    finally:
+        # Release temporary tasks before rebuilding the runtime-owned tasks.
+        pulse_ai_task.close()
+        pulse_ao_task.close()
+        reconfigure_daq("AO", ao_task_index)
+        reconfigure_daq("AI", 0)
+        if was_ao_running:
+            write_daq("AO", ao_task_index)
+            ao_item.native.start()
+            ao_item.running = True
+        if was_ai_running:
+            ai_item.native.start()
+            ai_item.running = True
+            runtime_.ai_tasks[0] = ai_item.native
+
+
 def stop_ai(index: int) -> None:
     """Stop AI acquisition and cache a final block when available."""
     runtime_ = get_runtime()

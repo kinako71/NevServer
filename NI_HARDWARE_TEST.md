@@ -105,12 +105,12 @@ RUN PSA
 `RUN PSA`はバックグラウンドで動くため、完了するまで状態を確認します。
 
 ```text
-GET PSA STAT
-GET PSA STAT
-GET PSA DATA 0-
+GET PSA NS STAT
+GET PSA NS STAT
+GET PSA NS DATA 0-
 ```
 
-状態が`COMPLETE`になってから`GET PSA DATA 0-`を実行します。波形データが
+状態が`COMPLETE`になってから`GET PSA NS DATA 0-`を実行します。波形データが
 複数行で返り、最後に`#OK`が付けば測定結果の取得まで完了です。計測を中断する
 場合だけ、実行中に次を送ります。
 
@@ -118,7 +118,29 @@ GET PSA DATA 0-
 STOP PSA
 ```
 
-## 4. NI-SCOPE計測とPRC集計（任意）
+## 4. DAQmx同期パルス計測（PULSE）
+
+`SET PULSE`の後は、各行を送るたびにサーバーの`#OK`を待ちます。AOタスク番号は
+`GET DAQMXINFO`の番号、AOチャンネル番号は物理チャンネル名の`ao`の後の数字です。
+以下ではAOタスク0の`ao52`を使います。AIはAIタスク0の先頭チャンネルを使います。
+`290 mV`の出力を配線前に確認し、接続先の許容電圧に合わせて振幅を下げてください。
+
+```text
+SET PULSE 0 52
+100000 0.1
+20 4 290
+GET PULSE
+```
+
+1行目はサンプリング周波数(Hz)と計測時間(s)、2行目は遅延(ms)・パルス幅(ms)・
+振幅(mV)です。各数値行の後に`#OK`が返ります。2行目の処理ではAIをAOの開始
+トリガーに同期させて有限計測し、最後の`#OK`後に`GET PULSE`で取得します。
+結果は`#GETPULSE <サンプル数>`、設定値の行、続いて`時刻(s) AO電圧(V) AI電圧(V)`
+の各サンプル行です。最後は`#OK`です。
+
+`GET PULSE`は結果をメモリに保持するため、次回の`SET PULSE`で更新されます。
+
+## 5. NI-SCOPE計測とPRC集計（任意）
 
 PSAと同じ掃引・取得をPRCコマンドで行い、各波形のpeak-to-peak値を取得します。
 

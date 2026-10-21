@@ -42,6 +42,8 @@ C 版 `nev_server` と同じく、クライアントは `localhost:9000` に TCP
 
 シェルコマンドはbootstrap.pyが列挙した物理グループをそのまま使います。`GET AO/AI/DO/DI <index>`でタスク値を読み、`SET AO <index> <channel>`でAO波形、`SET DO <index> <values...>`でDO値を設定します。AOの長さとサンプル周波数は`SET AO DLEN/FREQ`、出力開始停止は`RUN/STOP AO`で操作します。AIは`RUN/STOP AI`で制御し、`GET AI`で1ブロックを読みます。各グループのタスク番号は`GET DAQMXINFO`に表示されます。
 
+PSAの読み出しコマンドはNI-SCOPE用の`GET PSA NS DATA/STAT`とDAQmx用の`GET PSA DAQ DATA/STAT`に分かれています。DAQmx用の設定・実行コマンドは未実装のため、現時点ではDAQmx PSAのデータはまだ生成されません。
+
 実機用Python依存は次のコマンドで追加できます:
 
 ```bash

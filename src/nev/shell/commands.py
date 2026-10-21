@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from nev.handlers import device, device_commands, sys
+from nev.handlers import device, device_commands, pulse, sys
 from nev.shell.parser import CommandNode
 
 S = device_commands.handler_for
@@ -46,14 +46,25 @@ def build_command_tree() -> CommandNode:
             com_set_nsu,
             CommandNode(literal="PSA", handler=S("SET PSA")),
             CommandNode(literal="PRC", handler=S("SET PRC")),
+            CommandNode(literal="PULSE", handler=pulse.set_pulse),
         ]
     )
 
-    com_get_psa_data = CommandNode(literal="DATA", handler=S("GET PSA DATA"))
-    com_get_psa_stat = CommandNode(literal="STAT", handler=S("GET PSA STAT"))
+    com_get_psa_ns_data = CommandNode(literal="DATA", handler=S("GET PSA NS DATA"))
+    com_get_psa_ns_stat = CommandNode(literal="STAT", handler=S("GET PSA NS STAT"))
+    com_get_psa_ns = CommandNode(
+        literal="NS",
+        children=[com_get_psa_ns_data, com_get_psa_ns_stat],
+    )
+    com_get_psa_daq_data = CommandNode(literal="DATA", handler=S("GET PSA DAQ DATA"))
+    com_get_psa_daq_stat = CommandNode(literal="STAT", handler=S("GET PSA DAQ STAT"))
+    com_get_psa_daq = CommandNode(
+        literal="DAQ",
+        children=[com_get_psa_daq_data, com_get_psa_daq_stat],
+    )
     com_get_psa = CommandNode(
         literal="PSA",
-        children=[com_get_psa_data, com_get_psa_stat],
+        children=[com_get_psa_ns, com_get_psa_daq],
     )
     com_get_prc = CommandNode(literal="PRC", handler=S("GET PRC"))
 
@@ -80,6 +91,7 @@ def build_command_tree() -> CommandNode:
             CommandNode(literal="SYSINFO", handler=sys.nev_sys_echoinfo),
             CommandNode(literal="DAQMXINFO", handler=device.get_daqmx_info),
             CommandNode(literal="NISCOPEINFO", handler=S("GET NISCOPEINFO")),
+            CommandNode(literal="PULSE", handler=pulse.get_pulse),
             CommandNode(literal="AO", handler=device.get_ao),
             CommandNode(literal="DO", handler=device.get_do),
             CommandNode(literal="AI", handler=device.get_ai),
