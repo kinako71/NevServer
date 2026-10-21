@@ -166,6 +166,27 @@ GET PRC DATA 0-
 で完了済みポイントを取得します。DATAのポイント指定は`N`、`N-M`、`N-`です。
 各ポイントは位相(ms)とPRC値を返します。例は26点×8回です。
 
+応答の形式は次の通りです。STATの状態は`FAILED`、`CONFIGURED`、`IDLE`、`RUNNING`、
+`COMPLETE`、`ABORTED`、`UNKNOWN`のいずれかです。計測中のDATA取得では、完了した
+位相ポイントまでを指定できます。
+
+```text
+GET PRC STAT
+#PRCSTAT
+<読取可能ポイント数> <現在の位相(ms)> <状態> [エラーメッセージ]
+#OK
+
+GET PRC DATA 0-2
+#PRCDATA 0 2
+<位相0(ms)>
+[<PRC値0>]
+<位相1(ms)>
+[<PRC値1>]
+<位相2(ms)>
+[<PRC値2>]
+#OK
+```
+
 ## 失敗時に記録する情報
 
 - 実行したコマンドと、その直後に返った応答全文

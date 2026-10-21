@@ -51,6 +51,9 @@ cd python
 ./.venv/bin/pip install -e '.[hardware]'
 ```
 
-`SET PRC` / `RUN PRC` / `GET PRC` はPython版の追加コマンドで、PSA走査を行い各波形のpeak-to-peak値をパラメータに対して返します。
+`SET PRC <AOタスク> <AOチャンネル>`に続けて、最大位相時間(ms)・位相刻み(ms)・
+繰り返し回数、その後にAIしきい値(mV)・パルス幅(ms)・基準AO値からのパルス振幅(mV)を
+指定します。`RUN PRC`で計測し、`GET PRC STAT`で進行状態、`GET PRC DATA N|N-M|N-`で
+位相ごとのPRC値を取得します。応答ヘッダーはそれぞれ`#PRCSTAT`と`#PRCDATA`です。
 
 NI実機の動作確認手順は [NI_HARDWARE_TEST.md](NI_HARDWARE_TEST.md) を参照してください。
