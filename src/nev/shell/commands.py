@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from nev.handlers import device, device_commands, pulse, sys
+from nev.handlers import device, device_commands, prc, pulse, sys
 from nev.shell.parser import CommandNode
 
 S = device_commands.handler_for
@@ -45,7 +45,7 @@ def build_command_tree() -> CommandNode:
             com_set_ao_branch,
             com_set_nsu,
             CommandNode(literal="PSA", handler=S("SET PSA")),
-            CommandNode(literal="PRC", handler=S("SET PRC")),
+            CommandNode(literal="PRC", handler=prc.set_prc),
             CommandNode(literal="PULSE", handler=pulse.set_pulse),
         ]
     )
@@ -66,7 +66,7 @@ def build_command_tree() -> CommandNode:
         literal="PSA",
         children=[com_get_psa_ns, com_get_psa_daq],
     )
-    com_get_prc = CommandNode(literal="PRC", handler=S("GET PRC"))
+    com_get_prc = CommandNode(literal="PRC", handler=prc.get_prc)
 
     com_get_nsu_num = CommandNode(literal="NUM", handler=S("GET NSU NUM"))
     com_get_nsu_devs = CommandNode(literal="DEVS", handler=S("GET NSU DEVS"))
@@ -111,7 +111,7 @@ def build_command_tree() -> CommandNode:
                 com_run_ao,
                 CommandNode(literal="AI", handler=device.run_ai),
                 com_run_psa,
-                CommandNode(literal="PRC", handler=S("RUN PRC")),
+                CommandNode(literal="PRC", handler=prc.run_prc),
                 CommandNode(literal="PULSE", handler=pulse.run_pulse),
             ]),
             CommandNode(literal="STOP", children=[

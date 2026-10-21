@@ -794,6 +794,214 @@ def acquire_pulse(
             runtime_.ai_tasks[0] = ai_item.native
 
 
+def acquire_prc_series(
+    *,
+    ao_task_index: int,
+    ao_channel_index: int,
+    phases_ms: list[float],
+    repeats: int,
+    threshold_mv: float,
+    pulse_width_ms: float,
+    pulse_amplitude_mv: float,
+) -> list[dict[str, float]]:
+    """Measure threshold-crossing timing changes for each AO pulse phase.
+
+    The fixed acquisition rate, record length, pretrigger, and reference
+    trigger route follow ``PRC.py``; command settings provide threshold,
+    pulse width, and pulse amplitude. Mock mode returns deterministic
+    synthetic crossing metrics. Real mode routes the AI reference trigger to PXI_Trig0 and runs finite
+    analog-input/reference-trigger and digital-triggered analog-output tasks.
+    """
+    import math
+
+    ai_rate = 100_000.0
+    ai_samples = 40_000
+    pretrigger_samples = 2
+    threshold = threshold_mv / 1000.0
+    ao_rate = 100_000.0
+    pulse_samples = max(1, round(ao_rate * pulse_width_ms / 1000.0))
+
+    runtime_ = get_runtime()
+    if runtime_.mock:
+        from nev.handlers import device_commands
+
+        ao_tasks = device_commands.TASKS["AO"]
+        ai_tasks = device_commands.TASKS["AI"]
+    else:
+        ao_tasks = runtime_.daq["AO"]
+        ai_tasks = runtime_.daq["AI"]
+    if not ao_tasks or not ai_tasks:
+        raise RuntimeError("PRC acquisition requires both AO and AI devices")
+    if not 0 <= ao_task_index < len(ao_tasks):
+        raise IndexError(f"Invalid AO task index: {ao_task_index}")
+
+    ao_item = ao_tasks[ao_task_index]
+    ai_item = ai_tasks[0]
+    if runtime_.mock:
+        channel_position = ao_channel_index
+        ao_channel = f"ao{ao_channel_index}"
+        ai_channel = "mock/ai0"
+    else:
+        matches = [
+            channel for channel in ao_item.channels
+            if channel.rsplit("/", 1)[-1].lower() == f"ao{ao_channel_index}".lower()
+        ]
+        if not matches:
+            raise ValueError(f"AO channel ao{ao_channel_index} is not on {ao_item.name}")
+        if not ai_item.channels:
+            raise RuntimeError("AI task 0 has no configured channels")
+        ao_channel = matches[0]
+        ai_channel = ai_item.channels[0]
+        channel_position = ao_item.channels.index(ao_channel)
+
+    value_offset = channel_position * ao_item.length
+    baseline = (
+        float(ao_item.values[value_offset])
+        if value_offset < len(ao_item.values)
+        else 0.0
+    )
+    pulse_voltage = baseline + pulse_amplitude_mv / 1000.0
+    if not -10.0 <= pulse_voltage <= 10.0:
+        raise ValueError(
+            f"Pulse voltage {pulse_voltage:g} V is outside the -10 to 10 V range"
+        )
+
+    # Avoid holding millions of mock samples; return the same derived values
+    # that the real path computes from threshold crossings.
+    if runtime_.mock:
+        max_phase = max(phases_ms, default=1.0)
+        series = []
+        for phase_ms in phases_ms:
+            phase_response = 0.002 * math.sin(
+                math.pi * phase_ms / max(max_phase, 1.0)
+            ) * (pulse_width_ms / 4.0) * (pulse_amplitude_mv / 100.0)
+            changes = [
+                0.05 - phase_response + (trial - (repeats - 1) / 2) * 1e-6
+                for trial in range(repeats)
+            ]
+            periods = [0.05 + (trial - (repeats - 1) / 2) * 1e-6
+                       for trial in range(repeats)]
+            series.append({"phase_ms": phase_ms, "changes": changes, "periods": periods})
+        return series
+
+    import nidaqmx
+    from nidaqmx.constants import AcquisitionType, Edge, Slope
+    from nidaqmx.system import System
+
+    was_ao_running = ao_item.running
+    was_ai_running = ai_item.running
+    runtime_.ai_tasks.pop(0, None)
+    for item in (ao_item, ai_item):
+        if item.native is not None:
+            try:
+                if item.running:
+                    item.native.stop()
+            finally:
+                item.native.close()
+                item.native = None
+                item.running = False
+
+    system = System.local()
+    route_source = f"/{ai_item.name}/te0/ReferenceTrigger"
+    route_destination = f"/{ai_item.name}/PXI_Trig0"
+    route_connected = False
+    results: list[dict[str, float]] = []
+    try:
+        system.connect_terms(route_source, route_destination)
+        route_connected = True
+
+        for phase_ms in phases_ms:
+            delay_samples = round(phase_ms * ao_rate / 1000.0)
+            ao_data = (
+                [baseline] * delay_samples
+                + [pulse_voltage] * pulse_samples
+                + [baseline]
+            )
+            changes: list[float] = []
+            periods: list[float] = []
+
+            for _trial in range(repeats):
+                with nidaqmx.Task() as ai_task, nidaqmx.Task() as ao_task:
+                    ai_task.ai_channels.add_ai_voltage_chan(
+                        ai_channel, min_val=-10.0, max_val=10.0
+                    )
+                    ai_task.timing.cfg_samp_clk_timing(
+                        rate=ai_rate,
+                        sample_mode=AcquisitionType.FINITE,
+                        samps_per_chan=ai_samples,
+                    )
+                    ai_task.triggers.reference_trigger.cfg_anlg_edge_ref_trig(
+                        trigger_source=ai_channel,
+                        trigger_slope=Slope.RISING,
+                        trigger_level=threshold,
+                        pretrigger_samples=pretrigger_samples,
+                    )
+
+                    ao_task.ao_channels.add_ao_voltage_chan(
+                        ao_channel, min_val=-10.0, max_val=10.0
+                    )
+                    ao_task.timing.cfg_samp_clk_timing(
+                        rate=ao_rate,
+                        sample_mode=AcquisitionType.FINITE,
+                        samps_per_chan=len(ao_data),
+                    )
+                    ao_task.triggers.start_trigger.cfg_dig_edge_start_trig(
+                        trigger_source=f"/{ao_item.name}/PXI_Trig0",
+                        trigger_edge=Edge.RISING,
+                    )
+                    ao_task.out_stream.output_buf_size = len(ao_data)
+                    ao_task.write(ao_data, auto_start=False)
+
+                    # Arm the AO trigger wait first, then start the AI reference acquisition.
+                    ao_task.start()
+                    ai_task.start()
+                    ai_task.wait_until_done(timeout=30.0)
+                    ao_task.wait_until_done(timeout=5.0)
+                    samples = ai_task.read(
+                        number_of_samples_per_channel=ai_samples,
+                        timeout=5.0,
+                    )
+
+                crossing_times = []
+                for index in range(len(samples) - 1):
+                    first = float(samples[index])
+                    second = float(samples[index + 1])
+                    if first < threshold <= second and second != first:
+                        crossing = index + (threshold - first) / (second - first)
+                        crossing_times.append(
+                            (crossing - pretrigger_samples) / ai_rate
+                        )
+                differences = [
+                    crossing_times[index + 1] - crossing_times[index]
+                    for index in range(len(crossing_times) - 1)
+                ]
+                changes.append(differences[0] if differences else math.nan)
+                periods.append(
+                    sum(differences) / len(differences)
+                    if differences else math.nan
+                )
+
+            results.append({
+                "phase_ms": phase_ms,
+                "changes": changes,
+                "periods": periods,
+            })
+        return results
+    finally:
+        if route_connected:
+            system.disconnect_terms(route_source, route_destination)
+        reconfigure_daq("AO", ao_task_index)
+        reconfigure_daq("AI", 0)
+        if was_ao_running:
+            write_daq("AO", ao_task_index)
+            ao_item.native.start()
+            ao_item.running = True
+        if was_ai_running:
+            ai_item.native.start()
+            ai_item.running = True
+            runtime_.ai_tasks[0] = ai_item.native
+
+
 def stop_ai(index: int) -> None:
     """Stop AI acquisition and cache a final block when available."""
     runtime_ = get_runtime()
