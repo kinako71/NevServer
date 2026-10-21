@@ -684,7 +684,6 @@ def acquire_pulse(
         raise ValueError("Acquisition must contain at least one sample")
     delay_samples = round(delay_ms * sample_rate / 1000.0)
     width_samples = max(1, round(width_ms * sample_rate / 1000.0))
-    pulse_voltage = amplitude_mv / 1000.0
     # Preserve the selected channel's configured starting value before and
     # after the pulse instead of forcing the Pulse_Stimulus.py 0.28 V baseline.
     value_offset = ao_value_index * ao_item.length
@@ -693,6 +692,12 @@ def acquire_pulse(
         if value_offset < len(ao_item.values)
         else 0.0
     )
+    # The requested amplitude is an increment above the channel's baseline.
+    pulse_voltage = baseline + amplitude_mv / 1000.0
+    if not -10.0 <= pulse_voltage <= 10.0:
+        raise ValueError(
+            f"Pulse voltage {pulse_voltage:g} V is outside the -10 to 10 V range"
+        )
     ao_values = [baseline] * count
     pulse_end = min(count, delay_samples + width_samples)
     for sample in range(min(count, delay_samples), pulse_end):
