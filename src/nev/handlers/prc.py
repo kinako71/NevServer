@@ -234,7 +234,7 @@ def get_prc_data(args: list[str], connection: ShellConnection) -> int:
     if begin < 0 or begin >= len(PRC["results"]) or end < begin or end >= len(PRC["results"]):
         return connection.sh_error("!INDEX_OUT_OF_RANGE")
 
-    if connection.send_text(f"#PSADATA {begin} {end}\n") < 0:
+    if connection.send_text(f"#PRCDATA {begin} {end}\n") < 0:
         return -17
     for result in PRC["results"][begin:end + 1]:
         if connection.send_text(
@@ -260,7 +260,7 @@ def get_prc_stat(args: list[str], connection: ShellConnection) -> int:
     }.get(PRC["status"], "UNKNOWN")
     error = f" {PRC['error']}" if status == "FAILED" and PRC["error"] else ""
     response = (
-        f"#PSASTAT\n{len(PRC['results'])} "
+        f"#PRCSTAT\n{len(PRC['results'])} "
         f"{PRC['current_parameter']:f} {status}{error}\n"
     )
     return connection.sh_term(response)
