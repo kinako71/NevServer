@@ -755,6 +755,9 @@ def acquire_pulse(
             signal_id=Signal.START_TRIGGER,
             output_terminal=trigger,
         )
+        # Explicitly allocate the finite AO buffer before writing. Some
+        # DAQmx/device combinations leave it at zero after timing setup alone.
+        pulse_ao_task.out_stream.output_buf_size = count
         pulse_ao_task.write(ao_values, auto_start=False)
 
         # Arm AI first so it is waiting when AO exports its start trigger.
