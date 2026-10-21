@@ -112,6 +112,7 @@ def build_command_tree() -> CommandNode:
                 CommandNode(literal="AI", handler=device.run_ai),
                 com_run_psa,
                 CommandNode(literal="PRC", handler=S("RUN PRC")),
+                CommandNode(literal="PULSE", handler=pulse.run_pulse),
             ]),
             CommandNode(literal="STOP", children=[
                 com_stop_psa,

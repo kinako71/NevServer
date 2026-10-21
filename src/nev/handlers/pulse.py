@@ -128,30 +128,40 @@ def _receive_pulse_rows(buffer: str, connection: object) -> tuple[int, int]:
 
         PULSE.update(
             delay_ms=delay_ms, width_ms=width_ms,
-            amplitude_mv=amplitude_mv, status="RUNNING",
-        )
-        try:
-            result = acquire_pulse(
-                ao_task_index=PULSE["ao_task"],
-                ao_channel_index=PULSE["ao_channel"],
-                sample_rate=PULSE["sample_rate"],
-                duration=PULSE["duration"],
-                delay_ms=delay_ms,
-                width_ms=width_ms,
-                amplitude_mv=amplitude_mv,
-            )
-        except Exception as exc:
-            PULSE.update(status="FAILED", error=str(exc))
-            connection.sh_error(f"!DAQMX_API_ERROR({exc})")
-            return -1, consumed
-
-        PULSE.update(
-            time=result["time"], ao=result["ao"], ai=result["ai"],
-            status="COMPLETE", error="",
+            amplitude_mv=amplitude_mv, status="READY",
         )
         if connection.sh_term() < 0:
             return -1, consumed
         return 0, consumed
+
+
+def run_pulse(args: list[str], connection: ShellConnection) -> int:
+    """Run the saved pulse setup and retain its synchronized waveforms."""
+    if args:
+        return connection.sh_error("!INVALID_PULSE_CONFIGURATION")
+    if PULSE["status"] not in ("READY", "COMPLETE"):
+        return connection.sh_error("!PULSE_NOT_CONFIGURED")
+
+    PULSE.update(status="RUNNING", error="", time=[], ao=[], ai=[])
+    try:
+        result = acquire_pulse(
+            ao_task_index=PULSE["ao_task"],
+            ao_channel_index=PULSE["ao_channel"],
+            sample_rate=PULSE["sample_rate"],
+            duration=PULSE["duration"],
+            delay_ms=PULSE["delay_ms"],
+            width_ms=PULSE["width_ms"],
+            amplitude_mv=PULSE["amplitude_mv"],
+        )
+    except Exception as exc:
+        PULSE.update(status="FAILED", error=str(exc))
+        return connection.sh_error(f"!DAQMX_API_ERROR({exc})")
+
+    PULSE.update(
+        time=result["time"], ao=result["ao"], ai=result["ai"],
+        status="COMPLETE", error="",
+    )
+    return connection.sh_term()
 
 
 def get_pulse(args: list[str], connection: ShellConnection) -> int:
