@@ -803,23 +803,19 @@ def acquire_prc_series(
     threshold_mv: float,
     pulse_width_ms: float,
     pulse_amplitude_mv: float,
-    progress_callback: Callable[
-        [float, list[float] | None, list[float] | None], None
-    ] | None = None,
-) -> list[dict[str, float]]:
-    """Measure threshold-crossing timing changes for each AO pulse phase.
+    progress_callback: Callable[[float, dict[str, Any] | None], None] | None = None,
+) -> list[dict[str, Any]]:
+    """Follow PRC.py: capture per-phase references, then compare each trial.
 
-    The fixed acquisition rate, record length, pretrigger, and reference
-    trigger route follow ``PRC.py``; command settings provide threshold,
-    pulse width, and pulse amplitude. Mock mode returns deterministic
-    synthetic crossing metrics. Real mode routes the AI reference trigger to PXI_Trig0 and runs finite
-    analog-input/reference-trigger and digital-triggered analog-output tasks.
+    A PRC data point is the average of normalized timing changes from the
+    trials: (reference target time - stimulus target time) / reference period.
     """
     import math
+    import time
 
     ai_rate = 100_000.0
     ai_samples = 40_000
-    pretrigger_samples = 2
+    pretrigger_samples = 30_000
     threshold = threshold_mv / 1000.0
     ao_rate = 100_000.0
     pulse_samples = max(1, round(ao_rate * pulse_width_ms / 1000.0))
@@ -869,31 +865,28 @@ def acquire_prc_series(
             f"Pulse voltage {pulse_voltage:g} V is outside the -10 to 10 V range"
         )
 
-    # Avoid holding millions of mock samples; return the same derived values
-    # that the real path computes from threshold crossings.
+    # Mock mode produces per-trial metrics with the same aggregation as real
+    # acquisition, without allocating full 40,000-sample waveforms.
     if runtime_.mock:
         max_phase = max(phases_ms, default=1.0)
         series = []
         for phase_ms in phases_ms:
             if progress_callback is not None:
-                progress_callback(phase_ms, None, None)
+                progress_callback(phase_ms, None)
             phase_response = 0.002 * math.sin(
                 math.pi * phase_ms / max(max_phase, 1.0)
             ) * (pulse_width_ms / 4.0) * (pulse_amplitude_mv / 100.0)
-            changes = [
-                0.05 - phase_response + (trial - (repeats - 1) / 2) * 1e-6
-                for trial in range(repeats)
-            ]
-            periods = [0.05 + (trial - (repeats - 1) / 2) * 1e-6
-                       for trial in range(repeats)]
+            periods = [0.05 + (trial - (repeats - 1) / 2) * 1e-6 for trial in range(repeats)]
+            changes = [phase_response * period for period in periods]
+            normalized = [change / period for change, period in zip(changes, periods)]
+            metrics = {"changes": changes, "periods": periods, "normalized": normalized}
             if progress_callback is not None:
-                progress_callback(phase_ms, changes, periods)
-            series.append({"phase_ms": phase_ms, "changes": changes, "periods": periods})
+                progress_callback(phase_ms, metrics)
+            series.append({"phase_ms": phase_ms, **metrics})
         return series
 
     import nidaqmx
     from nidaqmx.constants import AcquisitionType, Edge, Slope
-    from nidaqmx.system import System
 
     was_ao_running = ao_item.running
     was_ai_running = ai_item.running
@@ -908,28 +901,97 @@ def acquire_prc_series(
                 item.native = None
                 item.running = False
 
-    system = System.local()
-    route_source = f"/{ai_item.name}/te0/ReferenceTrigger"
-    route_destination = f"/{ai_item.name}/PXI_Trig0"
-    route_connected = False
-    results: list[dict[str, float]] = []
-    try:
-        system.connect_terms(route_source, route_destination)
-        route_connected = True
+    reference_trigger_output = f"/{ai_item.name}/PXI_Trig0"
+    ao_trigger_source = f"/{ao_item.name}/PXI_Trig0"
+    results: list[dict[str, Any]] = []
 
+    def acquire_reference() -> list[float]:
+        """Acquire one natural firing waveform without an AO pulse."""
+        with nidaqmx.Task() as reference_task:
+            reference_task.ai_channels.add_ai_voltage_chan(
+                ai_channel, min_val=-10.0, max_val=10.0
+            )
+            reference_task.timing.cfg_samp_clk_timing(
+                rate=ai_rate,
+                sample_mode=AcquisitionType.FINITE,
+                samps_per_chan=ai_samples,
+            )
+            reference_task.triggers.reference_trigger.cfg_anlg_edge_ref_trig(
+                trigger_source=ai_channel,
+                trigger_slope=Slope.RISING,
+                trigger_level=threshold,
+                pretrigger_samples=pretrigger_samples,
+            )
+            reference_task.start()
+            reference_task.wait_until_done(timeout=30.0)
+            samples = reference_task.read(
+                number_of_samples_per_channel=ai_samples, timeout=5.0
+            )
+            return [float(value) for value in samples]
+
+    def analyze_crossings(samples: list[float]) -> list[float]:
+        """Interpolate rising threshold crossings relative to trigger time."""
+        crossings: list[float] = []
+        for index in range(len(samples) - 1):
+            first, second = samples[index], samples[index + 1]
+            if first < threshold <= second and second != first:
+                crossing = index + (threshold - first) / (second - first)
+                crossings.append((crossing - pretrigger_samples) / ai_rate)
+        return crossings
+
+    def calculate_trial(reference: list[float], stimulus: list[float]) -> dict[str, float]:
+        """Match PRC.py's crossing cleanup, target selection, and formula."""
+        reference_crossings = analyze_crossings(reference)
+        stimulus_crossings = analyze_crossings(stimulus)
+        empty = {"change": math.nan, "period": math.nan, "normalized": math.nan}
+        if len(reference_crossings) < 5 or len(stimulus_crossings) < 5:
+            return empty
+        reference_diffs = [
+            reference_crossings[index + 1] - reference_crossings[index]
+            for index in range(len(reference_crossings) - 1)
+        ]
+        filtered = [reference_crossings[0]]
+        for index, difference in enumerate(reference_diffs):
+            if difference >= 0.001:
+                filtered.append(reference_crossings[index + 1])
+        reference_diffs = [filtered[index + 1] - filtered[index]
+                           for index in range(len(filtered) - 1)]
+        if not reference_diffs:
+            return empty
+        period = sum(reference_diffs) / len(reference_diffs)
+        if not math.isfinite(period) or period <= 0:
+            return empty
+        reference_index = min(range(len(filtered)), key=lambda i: abs(filtered[i]))
+        stimulus_index = min(range(len(stimulus_crossings)), key=lambda i: abs(stimulus_crossings[i]))
+        reference_target = reference_index + 3
+        stimulus_target = stimulus_index + 3
+        if reference_target >= len(filtered) or stimulus_target >= len(stimulus_crossings):
+            return empty
+        change = filtered[reference_target] - stimulus_crossings[stimulus_target]
+        return {"change": change, "period": period, "normalized": change / period}
+
+    try:
+        # Like PRC.py, obtain a separate no-stimulus reference waveform for
+        # every phase before entering the trial-outer / phase-inner loop.
+        references: dict[float, list[float]] = {}
         for phase_ms in phases_ms:
             if progress_callback is not None:
-                progress_callback(phase_ms, None, None)
-            delay_samples = round(phase_ms * ao_rate / 1000.0)
-            ao_data = (
-                [baseline] * delay_samples
-                + [pulse_voltage] * pulse_samples
-                + [baseline]
-            )
-            changes: list[float] = []
-            periods: list[float] = []
+                progress_callback(phase_ms, None)
+            references[phase_ms] = acquire_reference()
 
-            for _trial in range(repeats):
+        trial_metrics: dict[float, list[dict[str, float]]] = {
+            phase_ms: [] for phase_ms in phases_ms
+        }
+        for _trial in range(repeats):
+            for phase_ms in phases_ms:
+                if progress_callback is not None:
+                    progress_callback(phase_ms, None)
+                delay_samples = round(phase_ms * ao_rate / 1000.0)
+                ao_data = (
+                    [baseline] * delay_samples
+                    + [pulse_voltage] * pulse_samples
+                    + [baseline]
+                )
                 with nidaqmx.Task() as ai_task, nidaqmx.Task() as ao_task:
                     ai_task.ai_channels.add_ai_voltage_chan(
                         ai_channel, min_val=-10.0, max_val=10.0
@@ -945,6 +1007,7 @@ def acquire_prc_series(
                         trigger_level=threshold,
                         pretrigger_samples=pretrigger_samples,
                     )
+                    ai_task.export_signals.ref_trig_output_term = reference_trigger_output
 
                     ao_task.ao_channels.add_ao_voltage_chan(
                         ao_channel, min_val=-10.0, max_val=10.0
@@ -955,52 +1018,38 @@ def acquire_prc_series(
                         samps_per_chan=len(ao_data),
                     )
                     ao_task.triggers.start_trigger.cfg_dig_edge_start_trig(
-                        trigger_source=f"/{ao_item.name}/PXI_Trig0",
+                        trigger_source=ao_trigger_source,
                         trigger_edge=Edge.RISING,
                     )
                     ao_task.out_stream.output_buf_size = len(ao_data)
                     ao_task.write(ao_data, auto_start=False)
 
-                    # Arm the AO trigger wait first, then start the AI reference acquisition.
-                    ao_task.start()
+                    # Match PRC.py's order: start AI, wait its pretrigger span,
+                    # then arm the AO task for the exported reference trigger.
                     ai_task.start()
+                    time.sleep(pretrigger_samples / ai_rate)
+                    ao_task.start()
                     ai_task.wait_until_done(timeout=30.0)
                     ao_task.wait_until_done(timeout=5.0)
                     samples = ai_task.read(
                         number_of_samples_per_channel=ai_samples,
                         timeout=5.0,
                     )
-
-                crossing_times = []
-                for index in range(len(samples) - 1):
-                    first = float(samples[index])
-                    second = float(samples[index + 1])
-                    if first < threshold <= second and second != first:
-                        crossing = index + (threshold - first) / (second - first)
-                        crossing_times.append(
-                            (crossing - pretrigger_samples) / ai_rate
-                        )
-                differences = [
-                    crossing_times[index + 1] - crossing_times[index]
-                    for index in range(len(crossing_times) - 1)
-                ]
-                changes.append(differences[0] if differences else math.nan)
-                periods.append(
-                    sum(differences) / len(differences)
-                    if differences else math.nan
+                trial_metrics[phase_ms].append(
+                    calculate_trial(references[phase_ms], [float(value) for value in samples])
                 )
 
-            results.append({
-                "phase_ms": phase_ms,
-                "changes": changes,
-                "periods": periods,
-            })
+        for phase_ms in phases_ms:
+            metrics = {
+                "changes": [item["change"] for item in trial_metrics[phase_ms]],
+                "periods": [item["period"] for item in trial_metrics[phase_ms]],
+                "normalized": [item["normalized"] for item in trial_metrics[phase_ms]],
+            }
+            results.append({"phase_ms": phase_ms, **metrics})
             if progress_callback is not None:
-                progress_callback(phase_ms, changes, periods)
+                progress_callback(phase_ms, metrics)
         return results
     finally:
-        if route_connected:
-            system.disconnect_terms(route_source, route_destination)
         reconfigure_daq("AO", ao_task_index)
         reconfigure_daq("AI", 0)
         if was_ao_running:

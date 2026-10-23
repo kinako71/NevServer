@@ -17,8 +17,8 @@ PRC = {
     "duration_ms": 0.0,
     "phase_step_ms": 0.0,
     "repeats": 0,
-    "threshold_mv": 70.0,
-    "pulse_width_ms": 4.0,
+    "threshold_mv": 100.0,
+    "pulse_width_ms": 0.5,
     "pulse_amplitude_mv": 100.0,
     "phases_ms": [],
     "current_parameter": 0.0,
@@ -157,17 +157,24 @@ def run_prc(args: list[str], connection: ShellConnection) -> int:
         """Acquire phase points and retain the metrics until the next setup."""
         def update_progress(
             phase_ms: float,
-            changes: list[float] | None,
-            periods: list[float] | None,
+            metrics: dict[str, list[float]] | None,
         ) -> None:
             """Expose the current phase and append each completed phase."""
             PRC["current_parameter"] = phase_ms
-            if changes is None or periods is None:
+            if metrics is None:
                 return
+            changes = metrics["changes"]
+            periods = metrics["periods"]
+            normalized = metrics["normalized"]
             valid_changes = [value for value in changes if math.isfinite(value)]
             valid_periods = [value for value in periods if math.isfinite(value)]
+            valid_normalized = [value for value in normalized if math.isfinite(value)]
             mean_change = sum(valid_changes) / len(valid_changes) if valid_changes else math.nan
             mean_period = sum(valid_periods) / len(valid_periods) if valid_periods else math.nan
+            mean_normalized = (
+                sum(valid_normalized) / len(valid_normalized)
+                if valid_normalized else math.nan
+            )
             variance_change = (
                 sum((value - mean_change) ** 2 for value in valid_changes) / (len(valid_changes) - 1)
                 if len(valid_changes) >= 2 else math.nan
@@ -176,10 +183,10 @@ def run_prc(args: list[str], connection: ShellConnection) -> int:
                 sum((value - mean_period) ** 2 for value in valid_periods) / (len(valid_periods) - 1)
                 if len(valid_periods) >= 2 else math.nan
             )
-            response = (
-                (mean_period - mean_change) / mean_period
-                if math.isfinite(mean_period) and mean_period != 0
-                and math.isfinite(mean_change) else math.nan
+            variance_normalized = (
+                sum((value - mean_normalized) ** 2 for value in valid_normalized)
+                / (len(valid_normalized) - 1)
+                if len(valid_normalized) >= 2 else math.nan
             )
             PRC["results"].append({
                 "phase_ms": phase_ms,
@@ -187,7 +194,10 @@ def run_prc(args: list[str], connection: ShellConnection) -> int:
                 "variance_change": variance_change,
                 "mean_period": mean_period,
                 "variance_period": variance_period,
-                "prc": response,
+                "mean_normalized_change": mean_normalized,
+                "variance_normalized_change": variance_normalized,
+                "valid_trials": len(valid_normalized),
+                "prc": mean_normalized,
             })
 
         try:

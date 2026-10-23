@@ -52,8 +52,11 @@ cd python
 ```
 
 `SET PRC <AOタスク> <AOチャンネル>`に続けて、最大位相時間(ms)・位相刻み(ms)・
-繰り返し回数、その後にAIしきい値(mV)・パルス幅(ms)・基準AO値からのパルス振幅(mV)を
-指定します。`RUN PRC`で計測し、`GET PRC STAT`で進行状態、`GET PRC DATA N|N-M|N-`で
+繰り返し回数、その後にAIしきい値(mV)・パルス幅(ms)・基準AO値からの振幅増分(mV)を
+指定します。`RUN PRC`では位相ごとに刺激なしの基準波形を取得した後、各試行の刺激波形を
+取得します。しきい値交差から時刻を補間し、基準波形と刺激波形の時刻ゼロに最も近い発火から
+3発火先の時間差を基準周期で割った値をPRCとして平均します。
+`GET PRC STAT`で進行状態、`GET PRC DATA N|N-M|N-`で
 位相ごとのPRC値を取得します。応答ヘッダーはそれぞれ`#PRCSTAT`と`#PRCDATA`です。
 
 NI実機の動作確認手順は [NI_HARDWARE_TEST.md](NI_HARDWARE_TEST.md) を参照してください。
